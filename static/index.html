@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>铅字归还助手</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>铅字归还助手</h1>
+  <nav>
+    <button class="nav-btn" data-view="run">归还作业</button>
+    <button class="nav-btn" data-view="tray">字盘编辑</button>
+    <button class="nav-btn" data-view="pending">待确认 <span id="pendingBadge" class="badge" hidden></span></button>
+    <button class="nav-btn" data-view="data">数据</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ============ 归还作业 ============ -->
+  <section id="view-run" class="view">
+    <div id="runEmpty" class="panel" hidden>
+      <h2>粘贴待归还清单</h2>
+      <p class="hint">每行一条：<code>字符 数量 [字体] [字号]</code>，也支持
+        <code>永×12</code>、<code>永,12,宋体,五号</code>。
+        合字、异体字与无法辨认（<code>?</code>）的铅字会自动列入「待确认」。</p>
+      <textarea id="pasteBox" rows="8" placeholder="例如：&#10;的 12&#10;永×3 宋体 五号&#10;體 2&#10;囍 1&#10;? 1"></textarea>
+      <div class="row">
+        <button id="btnParse" class="primary">解析并创建批次</button>
+      </div>
+    </div>
+
+    <div id="runActive" hidden>
+      <div class="run-layout">
+        <div class="tray-wrap">
+          <svg id="runTray" class="tray" role="img" aria-label="字盘"></svg>
+          <div class="legend">
+            <span><i class="sw sw-cur"></i>当前格</span>
+            <span><i class="sw sw-next"></i>下一格</span>
+            <span><i class="sw sw-done"></i>已完成</span>
+            <span><i class="sw sw-over"></i>超容</span>
+          </div>
+        </div>
+        <div class="run-side">
+          <div class="panel">
+            <div class="row between">
+              <h2 id="sessTitle">批次</h2>
+              <span id="sessProgress" class="muted"></span>
+            </div>
+            <div class="progress"><div id="progressBar"></div></div>
+
+            <div id="curTask" class="cur-task"></div>
+
+            <div class="scan-row">
+              <input id="scanInput" autocomplete="off"
+                     placeholder="扫描 / 输入格号后回车（空回车＝确认当前格）">
+              <input id="qtyInput" type="number" min="1" title="本次放入数量（默认全部）">
+            </div>
+            <div class="row">
+              <button id="btnConfirm" class="primary">确认放入</button>
+              <button id="btnUndo" title="撤销最近一次确认 (U)">撤销</button>
+              <button id="btnSkip" title="跳过当前格">跳过</button>
+            </div>
+            <div class="row">
+              <button id="btnFinish">完成批次</button>
+              <button id="btnAbandon" class="danger">作废批次</button>
+            </div>
+          </div>
+
+          <div id="conflictPanel" class="panel conflict" hidden></div>
+
+          <div class="panel">
+            <h3>取放顺序（蛇形规划）</h3>
+            <table class="tasks" id="taskTable">
+              <thead><tr><th>#</th><th>格号</th><th>字</th><th>数量</th><th>状态</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="runDone" class="panel" hidden>
+      <h2>本批归还完毕</h2>
+      <p class="hint">所有任务均已确认。可在「数据」页打印分拣标签或导出备份。</p>
+      <button id="btnNewSession" class="primary">开始新批次</button>
+    </div>
+  </section>
+
+  <!-- ============ 字盘编辑 ============ -->
+  <section id="view-tray" class="view" hidden>
+    <div class="tray-layout">
+      <div class="tray-wrap">
+        <svg id="editTray" class="tray" role="img" aria-label="字盘编辑"></svg>
+        <p class="hint">拖动格子照实物摆位；点击格子在右侧编辑属性。</p>
+      </div>
+      <div class="tray-side">
+        <div class="panel">
+          <h3>格位属性</h3>
+          <div id="cellForm" class="form" hidden>
+            <label>格号 <input id="fLabel"></label>
+            <label>字符 <input id="fChar" maxlength="4"></label>
+            <label>字体 <input id="fFont" placeholder="宋体 / 黑体…"></label>
+            <label>字号 <input id="fSize" placeholder="五号 / 小四…"></label>
+            <label>当前数量 <input id="fQty" type="number" min="0"></label>
+            <label>容量 <input id="fCapacity" type="number" min="1"></label>
+            <label>宽 <input id="fW" type="number" min="10"></label>
+            <label>高 <input id="fH" type="number" min="10"></label>
+            <div class="row">
+              <button id="btnDeleteCell" class="danger">删除此格</button>
+            </div>
+          </div>
+          <p id="cellFormHint" class="hint">未选中格位。</p>
+          <button id="btnNewCell">新建格位</button>
+        </div>
+        <div class="panel">
+          <h3>批量成行</h3>
+          <div class="form">
+            <label>格号前缀 <input id="gPrefix" value="H"></label>
+            <label>列数 <input id="gCols" type="number" value="8" min="1"></label>
+            <label>起始 X <input id="gX" type="number" value="20"></label>
+            <label>起始 Y <input id="gY" type="number" value="400"></label>
+            <label>间距 <input id="gGap" type="number" value="54"></label>
+            <label>容量 <input id="gCap" type="number" value="50"></label>
+          </div>
+          <button id="btnGenRow">生成一排空格</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 待确认 ============ -->
+  <section id="view-pending" class="view" hidden>
+    <div class="panel">
+      <h2>待确认铅字</h2>
+      <p class="hint">合字、异体字与无法辨认的铅字在此暂列。指定目标格后归位（将追加到当前归还批次），或忽略。</p>
+      <table class="tasks" id="pendingTable">
+        <thead><tr><th>字符</th><th>数量</th><th>原因</th><th>说明</th><th>目标格</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p id="pendingEmpty" class="hint" hidden>没有待确认的铅字。</p>
+    </div>
+  </section>
+
+  <!-- ============ 数据 ============ -->
+  <section id="view-data" class="view" hidden>
+    <div class="panel">
+      <h2>容量冲突检查</h2>
+      <div id="conflictList"></div>
+    </div>
+    <div class="panel">
+      <h2>打印临时分拣标签</h2>
+      <p class="hint">按当前批次的取放顺序生成带格号与坐标的标签，打印后裁剪使用。</p>
+      <button id="btnPrint">打印标签</button>
+    </div>
+    <div class="panel">
+      <h2>备份与恢复</h2>
+      <div class="row">
+        <button id="btnBackup">导出 JSON 备份</button>
+        <label class="btn-file">恢复备份<input id="restoreFile" type="file" accept=".json" hidden></label>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="printArea"></div>
+<div id="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
