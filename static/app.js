@@ -1,11 +1,11 @@
 'use strict';
 /* 铅字归还助手 —— 前端逻辑（原生 JS + SVG） */
 
-let S = { cells: [], session: null, pending: [], conflicts: {}, reason_names: {} };
+let S = { cells: [], session: null, last_done: null, pending: [],
+          conflicts: {}, reason_names: {} };
 let view = 'run';
 let selectedCellId = null;   // 字盘编辑页选中的格
 let conflictCtx = null;      // 当前未解决的冲突
-let justFinished = false;    // 刚完成一批（显示完成页）
 let suppressClickUntil = 0;  // 拖拽后短暂抑制点击选中
 
 const $ = (sel) => document.querySelector(sel);
@@ -171,10 +171,19 @@ const nextTask = () => S.session &&
 
 function renderRun() {
   const sess = S.session;
-  if (sess) justFinished = false;
-  $('#runEmpty').hidden = !!sess || justFinished;
+  const lastDone = S.last_done;
+  // 无进行中批次时：粘贴区始终可用；上一批次的收尾操作一并保留
+  $('#runEmpty').hidden = !!sess;
   $('#runActive').hidden = !sess;
-  $('#runDone').hidden = !!sess || !justFinished;
+  $('#runDone').hidden = !!sess || !lastDone;
+  if (lastDone && !sess) {
+    const ts = lastDone.tasks || [];
+    const qty = ts.reduce((a, t) => a + t.done_qty, 0);
+    $('#doneSummary').textContent =
+      '批次 #' + lastDone.id + '（' + (lastDone.finished_at || '') + '）· 共还 ' +
+      ts.length + ' 格 / ' + qty + ' 枚。可撤销最后一次确认、补打标签，' +
+      '或在下方直接粘贴新清单。';
+  }
   if (!sess) return;
 
   const tasks = sess.tasks;
@@ -249,21 +258,22 @@ function renderRun() {
   });
 }
 
+/* 用户在数量框填写的本次放入枚数（未填 = 全部剩余） */
+const userQty = () => parseInt($('#qtyInput').value, 10) || null;
+
 async function doConfirm() {
   const t = curTask();
   if (!t) return;
   const label = $('#scanInput').value.trim();
-  const qty = parseInt($('#qtyInput').value, 10) || null;
   await guard(async () => {
     const res = await api('/api/tasks/' + t.id + '/confirm', 'POST',
-      { label, qty });
+      { label, qty: userQty() });
     if (res.ok) {
       conflictCtx = null;
       $('#scanInput').value = '';
       $('#qtyInput').value = '';
-      if (!res.state.session) justFinished = true;   // 本批完毕
       applyState(res.state);
-      toast(justFinished ? '本批归还完毕' : '已确认放入');
+      toast(res.state.session ? '已确认放入' : '本批归还完毕');
     } else {
       conflictCtx = res.conflict;
       applyState(res.state);
@@ -288,10 +298,12 @@ function renderConflict() {
   if (c.type === 'overflow') {
     const cell = c.cell;
     const hasCand = c.candidates && c.candidates.length > 0;
-    html += '<p>改派前后对比：</p><div class="compare">' +
+    // 预览与确认一致：采用本次填写的数量（未填则为全部剩余）
+    const need = Math.min(userQty() || c.need, c.need);
+    html += '<p>改派前后对比（本次放入 ' + need + ' 枚）：</p><div class="compare">' +
       cellBox('改派前（当前格）', cell,
-        '<br><span class="diff-up">+' + c.need + ' 枚 → ' +
-        (cell.qty + c.need) + '/' + cell.capacity + ' 超容</span>') +
+        '<br><span class="diff-up">+' + need + ' 枚 → ' +
+        (cell.qty + need) + '/' + cell.capacity + ' 超容</span>') +
       '<div class="arrow">→</div>' +
       '<div class="box"><h4>改派后（候选格）</h4><div id="candInfo">' +
       (hasCand ? '请选择候选格' : '无可用候选格，请先在字盘编辑页添加空格位') +
@@ -331,20 +343,22 @@ function renderConflict() {
     const showCand = () => {
       const k = c.candidates.find((x) => String(x.id) === candSel.value);
       if (k) {
+        const need = Math.min(userQty() || c.need, c.need);
         $('#candInfo').innerHTML =
           '格号 <b>' + esc(k.label) + '</b><br>坐标 (' +
           Math.round(k.x) + ', ' + Math.round(k.y) + ')<br>存量 ' +
           k.qty + ' / ' + k.capacity +
-          '<br><span class="' + (k.free >= c.need ? 'diff-ok' : 'diff-up') +
-          '">+' + c.need + ' 枚 → ' + (k.qty + c.need) + '/' + k.capacity +
+          '<br><span class="' + (k.free >= need ? 'diff-ok' : 'diff-up') +
+          '">+' + need + ' 枚 → ' + (k.qty + need) + '/' + k.capacity +
           '</span>';
       }
     };
     candSel.onchange = showCand;
     showCand();
     $('#btnReassign').onclick = () => doReassign(parseInt(candSel.value, 10));
-    $('#btnForce').onclick = () => doForce();
   }
+  const force = $('#btnForce');
+  if (force) force.onclick = () => doForce();
   const rs = $('#btnReassignScanned');
   if (rs) rs.onclick = () => doReassign(c.scanned.id);
   const cancel = $('#btnCancelConflict');
@@ -358,11 +372,14 @@ async function doReassign(cellId) {
     const res = await api('/api/tasks/' + t.id + '/reassign', 'POST',
       { cell_id: cellId });
     if (res.warn) toast(res.warn, true);
-    // 改派成功后直接确认放入
-    const r2 = await api('/api/tasks/' + t.id + '/confirm', 'POST', {});
+    if (res.synced) toast('空格位已登记字种「' + t.char + '」');
+    // 改派成功后确认放入：严格采用本次填写的数量
+    const r2 = await api('/api/tasks/' + t.id + '/confirm', 'POST',
+      { qty: userQty() });
     if (r2.ok) {
       conflictCtx = null;
       $('#scanInput').value = '';
+      $('#qtyInput').value = '';
       applyState(r2.state);
       toast('已改派并确认放入');
     } else {
@@ -377,9 +394,10 @@ async function doForce() {
   if (!t) return;
   await guard(async () => {
     const res = await api('/api/tasks/' + t.id + '/confirm', 'POST',
-      { force: true });
+      { force: true, qty: userQty() });
     if (res.ok) {
       conflictCtx = null;
+      $('#qtyInput').value = '';
       applyState(res.state);
       toast('已强制放入（超容）', true);
     } else {
@@ -544,6 +562,26 @@ function renderData() {
   el.innerHTML = html;
 }
 
+/* 打印某批次的临时分拣标签（当前批次或最近完成的批次均可） */
+function printLabels(sess) {
+  if (!sess || !sess.tasks || !sess.tasks.length) {
+    toast('没有可打印标签的批次', true);
+    return;
+  }
+  $('#printArea').innerHTML =
+    '<div class="label-grid">' + sess.tasks.map((t) =>
+      '<div class="label-card">' +
+      '<div class="lc-head"><span>格号 <b>' + esc(t.label || '—') +
+      '</b></span><span>#' + t.seq + '</span></div>' +
+      '<div class="lc-char">' + esc(t.char) + '</div>' +
+      '<div class="lc-meta">' + esc(t.font || '—') + ' · ' +
+      esc(t.size || '—') + ' · ' + t.qty + ' 枚<br>' +
+      '坐标 (' + Math.round(t.x || 0) + ', ' + Math.round(t.y || 0) + ')' +
+      ' · 批次 #' + sess.id + '<br>' + esc(sess.created_at) + '</div></div>'
+    ).join('') + '</div>';
+  window.print();
+}
+
 function bindData() {
   $('#btnBackup').onclick = () => guard(async () => {
     const data = await api('/api/backup');
@@ -570,28 +608,8 @@ function bindData() {
     rd.readAsText(f);
     ev.target.value = '';
   });
-  $('#btnPrint').onclick = () => {
-    const sess = S.session;
-    const area = $('#printArea');
-    if (!sess || !sess.tasks.length) {
-      toast('当前没有进行中的批次，无法打印标签', true);
-      return;
-    }
-    const byId = {};
-    S.cells.forEach((c) => { byId[c.id] = c; });
-    area.innerHTML = '<div class="label-grid">' + sess.tasks.map((t) => {
-      const c = byId[t.cell_id] || {};
-      return '<div class="label-card">' +
-        '<div class="lc-head"><span>格号 <b>' + esc(t.label || '—') +
-        '</b></span><span>#' + t.seq + '</span></div>' +
-        '<div class="lc-char">' + esc(t.char) + '</div>' +
-        '<div class="lc-meta">' + esc(t.font || '—') + ' · ' +
-        esc(t.size || '—') + ' · ' + t.qty + ' 枚<br>' +
-        '坐标 (' + Math.round(c.x || 0) + ', ' + Math.round(c.y || 0) + ')' +
-        ' · 批次 #' + sess.id + '<br>' + esc(sess.created_at) + '</div></div>';
-    }).join('') + '</div>';
-    window.print();
-  };
+  // 无进行中批次时，补打最近完成批次的标签
+  $('#btnPrint').onclick = () => printLabels(S.session || S.last_done);
 }
 
 /* ---------------- 作业页绑定 ---------------- */
@@ -635,7 +653,23 @@ function bindRun() {
     conflictCtx = null;
     toast('批次已作废');
   });
-  $('#btnNewSession').onclick = () => { $('#runDone').hidden = true; renderRun(); };
+  // 上一批次收尾：撤销最后一次确认 / 补打标签 / 进入新清单
+  $('#btnDoneUndo').onclick = () => guard(async () => {
+    if (!S.last_done) return;
+    applyState((await api('/api/sessions/' + S.last_done.id + '/undo',
+      'POST')).state);
+    toast('已撤销，批次恢复进行中');
+    switchView('run');
+  });
+  $('#btnDonePrint').onclick = () => printLabels(S.last_done);
+  $('#btnNewSession').onclick = () => {
+    $('#pasteBox').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    $('#pasteBox').focus();
+  };
+  // 数量变化时实时刷新冲突面板的预览
+  $('#qtyInput').addEventListener('input', () => {
+    if (conflictCtx) renderConflict();
+  });
   document.addEventListener('keydown', (ev) => {
     if (view !== 'run' || !S.session) return;
     const tag = (ev.target.tagName || '').toLowerCase();

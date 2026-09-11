@@ -280,6 +280,74 @@ def run_tests():
         if c["label"].startswith("T"):
             call("DELETE", "/api/cells/%d" % c["id"])
 
+    print("== 17. 改派数量、空格位字种同步与批次收尾 ==")
+    # 第 8 组的改派应已把空格位 G6 同步为「永」
+    code, st = call("GET", "/api/state")
+    g6 = next(c for c in st["cells"] if c["label"] == "G6")
+    check("空格位首次接收后登记字种",
+          g6["char"] == "永" and g6["font"] == "宋体" and g6["size"] == "五号",
+          str(g6))
+
+    # 「的」只有 A1 一格，且第 12 组已把其容量压为 1，必然超容
+    code, res = call("POST", "/api/sessions", {"text": "的 3"})
+    check("创建收尾测试批次", res.get("ok"), str(res)[:150])
+    sess = res["state"]["session"]
+    t = sess["tasks"][0]
+    check("任务指向 A1", t["label"] == "A1", t["label"])
+    code, res = call("POST", "/api/tasks/%d/confirm" % t["id"], {})
+    check("确认触发超容", not res.get("ok")
+          and res["conflict"]["type"] == "overflow", str(res)[:150])
+    cand = res["conflict"]["candidates"][0]
+    code, res = call("POST", "/api/tasks/%d/reassign" % t["id"],
+                     {"cell_id": cand["id"]})
+    check("改派到空格位并同步字种", res.get("ok") and res.get("synced"),
+          str(res)[:150])
+    # 严格按本次填写的数量放入：剩余 3 枚中只放 1 枚
+    code, res = call("POST", "/api/tasks/%d/confirm" % t["id"], {"qty": 1})
+    check("部分数量确认成功", res.get("ok"), str(res)[:150])
+    st = res["state"]
+    cell = next(c for c in st["cells"] if c["id"] == cand["id"])
+    tb = next(x for x in st["session"]["tasks"] if x["id"] == t["id"])
+    check("格内只增加 1 枚", cell["qty"] == 1, str(cell["qty"]))
+    check("任务未完成（余 2 枚）",
+          tb["status"] == "active" and tb["done_qty"] == 1,
+          "%s %d" % (tb["status"], tb["done_qty"]))
+    check("新格位字种已同步", cell["char"] == "的" and cell["font"] == "宋体"
+          and cell["size"] == "五号", str(cell))
+    # 放入剩余 2 枚 → 批次完成
+    code, res = call("POST", "/api/tasks/%d/confirm" % t["id"], {})
+    check("剩余确认后批次完成",
+          res.get("ok") and res["state"]["session"] is None, str(res)[:150])
+    st = res["state"]
+    check("state 含最近完成批次",
+          st["last_done"] and st["last_done"]["id"] == sess["id"])
+    check("完成批次含任务（供补打标签）",
+          len(st["last_done"]["tasks"]) == 1)
+    # 完成后仍可撤销最后一次确认
+    code, res = call("POST", "/api/sessions/%d/undo" % sess["id"], {})
+    check("完成后撤销成功", res.get("ok"), str(res)[:150])
+    st = res["state"]
+    tb = st["session"]["tasks"][0]
+    check("批次恢复进行中", st["session"]["id"] == sess["id"]
+          and tb["status"] == "active" and tb["done_qty"] == 1)
+    cell = next(c for c in st["cells"] if c["id"] == cand["id"])
+    check("撤销回滚数量", cell["qty"] == 1, str(cell["qty"]))
+    call("POST", "/api/sessions/%d/abandon" % sess["id"], {})
+    # 字种同步后可再次按字种匹配（A1 容量 1 已满，应匹配到新格位）
+    code, res = call("POST", "/api/sessions", {"text": "的 1"})
+    t2 = res["state"]["session"]["tasks"][0]
+    check("同步字种后可再匹配", t2["label"] == cand["label"], t2["label"])
+    sid2 = res["state"]["session"]["id"]
+    # 有进行中批次时，禁止撤销已完成批次
+    code, st = call("GET", "/api/state")
+    done_id = st["last_done"]["id"]
+    code, res = call("POST", "/api/sessions/%d/undo" % done_id, {})
+    check("有进行中批次时禁止撤销已完成批次", code == 400, str(code))
+    call("POST", "/api/sessions/%d/abandon" % sid2, {})
+    code, res = call("POST", "/api/sessions/%d/undo" % done_id, {})
+    check("无进行中批次时可撤销已完成批次", res.get("ok"), str(res)[:150])
+    call("POST", "/api/sessions/%d/abandon" % done_id, {})
+
 
 if __name__ == "__main__":
     main()

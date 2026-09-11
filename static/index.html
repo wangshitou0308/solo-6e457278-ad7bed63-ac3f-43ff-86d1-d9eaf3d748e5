@@ -20,6 +20,16 @@
 <main>
   <!-- ============ 归还作业 ============ -->
   <section id="view-run" class="view">
+    <div id="runDone" class="panel" hidden>
+      <h2>上一批次已完结</h2>
+      <p id="doneSummary" class="hint"></p>
+      <div class="row">
+        <button id="btnDoneUndo">撤销最后一次确认</button>
+        <button id="btnDonePrint">补打本批标签</button>
+        <button id="btnNewSession" class="primary">开始新批次</button>
+      </div>
+    </div>
+
     <div id="runEmpty" class="panel" hidden>
       <h2>粘贴待归还清单</h2>
       <p class="hint">每行一条：<code>字符 数量 [字体] [字号]</code>，也支持
@@ -79,12 +89,6 @@
           </div>
         </div>
       </div>
-    </div>
-
-    <div id="runDone" class="panel" hidden>
-      <h2>本批归还完毕</h2>
-      <p class="hint">所有任务均已确认。可在「数据」页打印分拣标签或导出备份。</p>
-      <button id="btnNewSession" class="primary">开始新批次</button>
     </div>
   </section>
 
@@ -151,7 +155,8 @@
     </div>
     <div class="panel">
       <h2>打印临时分拣标签</h2>
-      <p class="hint">按当前批次的取放顺序生成带格号与坐标的标签，打印后裁剪使用。</p>
+      <p class="hint">按当前批次（无进行中批次时为最近完成的批次）的取放顺序，
+        生成带格号与坐标的标签，打印后裁剪使用。</p>
       <button id="btnPrint">打印标签</button>
     </div>
     <div class="panel">

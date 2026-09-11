@@ -263,18 +263,27 @@ def capacity_conflicts(cells, session):
 def get_state():
     with DB_LOCK:
         cells = rows("SELECT * FROM cells ORDER BY y, x, id")
+        task_cols = ("SELECT t.*, c.label, c.x, c.y, c.qty AS cell_qty, "
+                     "c.capacity FROM tasks t "
+                     "LEFT JOIN cells c ON c.id = t.cell_id "
+                     "WHERE t.session_id=? ORDER BY t.seq")
         sess = row("SELECT * FROM sessions WHERE status='active' "
                    "ORDER BY id DESC LIMIT 1")
         session = None
         if sess:
             session = dict(sess)
-            session["tasks"] = rows(
-                "SELECT t.*, c.label, c.x, c.y, c.qty AS cell_qty, c.capacity "
-                "FROM tasks t LEFT JOIN cells c ON c.id = t.cell_id "
-                "WHERE t.session_id=? ORDER BY t.seq", (sess["id"],))
+            session["tasks"] = rows(task_cols, (sess["id"],))
+        # 最近完成的批次：供完成页撤销收尾、补打标签
+        ds = row("SELECT * FROM sessions WHERE status='done' "
+                 "ORDER BY id DESC LIMIT 1")
+        last_done = None
+        if ds:
+            last_done = dict(ds)
+            last_done["tasks"] = rows(task_cols, (ds["id"],))
         pending = rows("SELECT * FROM pending_items WHERE status='open' "
                        "ORDER BY id")
-        return {"cells": cells, "session": session, "pending": pending,
+        return {"cells": cells, "session": session, "last_done": last_done,
+                "pending": pending,
                 "conflicts": capacity_conflicts(cells, session),
                 "reason_names": REASON_NAMES}
 
@@ -533,6 +542,13 @@ def reassign_task(task_id, body):
         raise ApiError("目标格位不存在")
     if old and new["id"] == old["id"]:
         raise ApiError("目标与原格位相同")
+    # 空格位首次接收铅字：同步登记字种（字符/字体/字号），便于之后再匹配
+    synced = False
+    if new["char"] == "" and t["char"]:
+        db.execute("UPDATE cells SET char=?, font=?, size=? WHERE id=?",
+                   (t["char"], t["font"], t["size"], new["id"]))
+        new = row("SELECT * FROM cells WHERE id=?", (new_id,))
+        synced = True
     snap = lambda c: {"id": c["id"], "label": c["label"], "x": c["x"],
                       "y": c["y"], "qty": c["qty"], "capacity": c["capacity"]}
     payload = {"before": snap(old) if old else None, "after": snap(new)}
@@ -546,7 +562,8 @@ def reassign_task(task_id, body):
     warn = None
     if new["qty"] + (t["qty"] - t["done_qty"]) > new["capacity"]:
         warn = "注意：改派到 %s 后仍将超出容量" % new["label"]
-    return {"ok": True, "warn": warn, "state": get_state()}
+    return {"ok": True, "warn": warn, "synced": synced,
+            "state": get_state()}
 
 
 @transactional
@@ -566,6 +583,11 @@ def undo(session_id):
     sess = row("SELECT * FROM sessions WHERE id=?", (session_id,))
     if not sess:
         raise ApiError("批次不存在", 404)
+    if sess["status"] == "abandoned":
+        raise ApiError("批次已作废，不能撤销")
+    if sess["status"] == "done" and row(
+            "SELECT id FROM sessions WHERE status='active'"):
+        raise ApiError("已有进行中的批次，请先完成或作废后再撤销上一批次")
     act = row("SELECT * FROM actions WHERE session_id=? AND kind='confirm' "
               "ORDER BY id DESC LIMIT 1", (session_id,))
     if not act:
