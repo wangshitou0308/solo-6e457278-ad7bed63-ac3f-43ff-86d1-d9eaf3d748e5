@@ -1561,52 +1561,59 @@ def _load_requisition(r):
         "SELECT * FROM req_issues WHERE req_id=? ORDER BY id", (d["id"],))
     held = _hold_map(d["id"])
     for a in d["allocations"]:
-        a["avail_other"] = max(0, a["cell_qty"] - held.get(a["cell_id"], 0))
-    d["totals"] = _req_totals(d["allocations"])
-    # 每条需求的计划预留 / 改选追加 / 实取 / 缺口（汇总只计 plan 行，
-    # change 与 gap 子行不与父计划行重复相加）
+        a["avail_other"] = max(0, a["cell_qty"]
+                               - held.get(a["cell_id"], 0))
+    d["totals"] = _req_totals(d["allocations"], d["demands"], d["status"])
+    # 每条需求的计划预留 / 改选实取 / 实取 / 缺口。
+    # 预留只计 plan 行；缺口一律按 需求量 − 实取量，与顶部合计口径一致。
     per_demand = {}
     for a in d["allocations"]:
         if a["status"] == "cancelled":
             continue
         x = per_demand.setdefault(a["demand_id"], {
-            "plan": 0, "change": 0, "gap": 0, "taken": 0,
-            "plan_left": 0})
+            "plan": 0, "change": 0, "gap_rows": 0, "taken": 0})
         kind = a["kind"] if a["kind"] in ("plan", "change", "gap") else "plan"
-        x[kind] += a["qty"]
+        if kind == "gap":
+            x["gap_rows"] += a["qty"]
+        else:
+            x[kind] += a["qty"]
         x["taken"] += a["taken_qty"]
-        # 计划行已取消 / 缺口之外仍未取的数量（整格未取也计入最终缺口）
-        if kind == "plan" and a["status"] != "done":
-            x["plan_left"] += a["qty"] - a["taken_qty"]
+    gap_sum = 0
     for dm in d["demands"]:
-        x = per_demand.get(dm["id"], {"plan": 0, "change": 0, "gap": 0,
-                                      "taken": 0, "plan_left": 0})
+        x = per_demand.get(dm["id"], {"plan": 0, "change": 0, "gap_rows": 0,
+                                      "taken": 0})
         dm["plan_qty"] = x["plan"]
         dm["change_qty"] = x["change"]
-        dm["gap_qty"] = x["gap"]
+        dm["gap_row_qty"] = x["gap_rows"]
         dm["taken_qty"] = x["taken"]
-        # 最终缺口 = 规划时就配不齐的部分 + 执行中保留的 gap 子行
-        # + 计划行 / 改选行未落实的余量
-        dm["gap_total"] = (max(0, dm["qty"] - x["plan"]) + x["gap"]
-                           + x["plan_left"])
+        # 缺口 = 需求量 − 实取量（需求行与顶部合计同一口径）
+        dm["gap_total"] = max(0, dm["qty"] - x["taken"])
+        gap_sum += dm["gap_total"]
+    d["totals"]["gap_qty"] = gap_sum
     return d
 
 
-def _req_totals(allocs):
-    """领用单数量汇总（避免父计划行与改选 / 缺口子行重复相加）。"""
-    plan = change = gap = taken = 0
+def _req_totals(allocs, demands=None, status="active"):
+    """领用单数量汇总。
+
+    预留只统计锁定时的计划分配（kind=plan），改选子行不重复计入；
+    缺口统一按「需求量 − 实取量」，与需求行口径保持一致。
+    """
+    plan = change = gap_rows = taken = 0
     for a in allocs:
         if a["status"] == "cancelled":
             continue
+        taken += a["taken_qty"]
         if a["kind"] == "gap" or a["status"] == "gap":
-            gap += a["qty"]
+            gap_rows += a["qty"]
         elif a["kind"] == "change":
             change += a["qty"]
         else:
             plan += a["qty"]
-        taken += a["taken_qty"]
-    return {"plan_qty": plan, "change_qty": change, "gap_qty": gap,
-            "taken_qty": taken, "reserved_qty": plan + change}
+    gap = (max(0, sum(dm["qty"] for dm in demands) - taken)
+           if demands is not None else gap_rows)
+    return {"plan_qty": plan, "change_qty": change, "gap_row_qty": gap_rows,
+            "gap_qty": gap, "taken_qty": taken, "reserved_qty": plan}
 
 
 def _req_brief(r):
@@ -1615,16 +1622,23 @@ def _req_brief(r):
     n = row("SELECT COUNT(*) AS n FROM req_allocations WHERE req_id=?",
             (r["id"],))
     d["n_allocs"] = n["n"]
-    # 预留合计只计 plan + change（缺口与已取消行不占库存，也不与父行重复相加）
+    # 预留（锁定量）只统计锁定时的计划分配（kind=plan）；
+    # 改选子行是少取后的替代来源，不能与父计划行重复相加
     tot = row(
-        "SELECT COALESCE(SUM(CASE WHEN kind IN ('plan','change') "
-        "AND status!='cancelled' THEN qty ELSE 0 END),0) AS r, "
-        "COALESCE(SUM(taken_qty),0) AS t FROM req_allocations "
-        "WHERE req_id=?", (r["id"],))
+        "SELECT COALESCE(SUM(CASE WHEN kind='plan' AND status!='cancelled' "
+        "THEN qty ELSE 0 END),0) AS r, "
+        "COALESCE(SUM(CASE WHEN status!='cancelled' THEN taken_qty ELSE 0 END),0) "
+        "AS t FROM req_allocations WHERE req_id=?", (r["id"],))
     d["qty_reserved"] = tot["r"]
     d["qty_taken"] = tot["t"]
     d["n_gap"] = row("SELECT COUNT(*) AS n FROM req_allocations "
                      "WHERE req_id=? AND status='gap'", (r["id"],))["n"]
+    # 历史 / 已结束单据：缺口一律按 需求量 − 实取量
+    demand_total = row(
+        "SELECT COALESCE(SUM(qty),0) AS n FROM req_demands WHERE req_id=?",
+        (r["id"],))["n"]
+    d["qty_gap"] = max(0, demand_total - tot["t"])
+    d["qty_demand"] = demand_total
     d["n_issue_demands"] = row(
         "SELECT COUNT(*) AS n FROM req_demands WHERE req_id=? AND issue!=''",
         (r["id"],))["n"]

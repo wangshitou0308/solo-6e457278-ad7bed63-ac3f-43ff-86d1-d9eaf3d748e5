@@ -1241,6 +1241,26 @@ def run_tests():
           str(req["totals"]) + " " + str(
               {k: dm_tong[k] for k in ("plan_qty", "gap_total", "taken_qty")}))
 
+    # 历史概要：锁定预留只统计计划行（改选子行不另计），缺口=需求-实取
+    hist = call("GET", "/api/state")[1]["req_history"]
+    brief = next(h for h in hist if h["id"] == rid)
+    check("历史预留等于锁定量（不含改选子行）",
+          brief["qty_reserved"] == req["totals"]["plan_qty"],
+          str((brief["qty_reserved"], req["totals"]["plan_qty"])))
+    check("历史缺口按需求量-实取量",
+          brief["qty_gap"] == brief["qty_demand"] - brief["qty_taken"]
+          and brief["qty_gap"] == req["totals"]["gap_qty"],
+          str({k: brief[k] for k in
+               ("qty_demand", "qty_reserved", "qty_taken", "qty_gap")}))
+    # 顶部合计缺口与需求行缺口一致（清单内统一口径）
+    demand_gap_sum = sum(d["gap_total"] for d in req["demands"])
+    check("顶部缺口与需求行缺口一致（需求-实取）",
+          req["totals"]["gap_qty"] == demand_gap_sum
+          and req["totals"]["gap_qty"]
+          == sum(d["qty"] for d in req["demands"])
+          - req["totals"]["taken_qty"],
+          str((req["totals"]["gap_qty"], demand_gap_sum)))
+
     # 一键带入归还流程：按实取数量生成规划态批次，逐格扫码照旧
     code, res = call("POST", "/api/requisitions/%d/to-return" % rid, {})
     check("一键带入归还流程", res.get("ok"), str(res)[:200])

@@ -1843,21 +1843,21 @@ function reqById(id) {
 }
 
 function reqDemandProgress(req, dm) {
-  // 预留合计只计计划行（plan）；改选子行是计划缺额的追加，缺口子行单列，
-  // 不能与父计划行重复相加（后端已按 kind 汇总）
+  // 预留只计计划行（plan）；缺口统一为 需求量 − 实取量（后端已按口径汇总）。
+  // change / gap 子行不与父计划行重复相加。
+  const allocs = req.allocations.filter((a) => a.demand_id === dm.id
+    && a.status !== 'cancelled');
+  const taken = allocs.reduce((s, a) => s + a.taken_qty, 0);
   return {
     reserved: dm.plan_qty != null ? dm.plan_qty
-      : req.allocations.filter((a) => a.demand_id === dm.id && a.kind === 'plan'
-        && a.status !== 'cancelled').reduce((a, x) => a + x.qty, 0),
-    change: dm.change_qty || 0,
-    taken: dm.taken_qty != null ? dm.taken_qty
-      : req.allocations.filter((a) => a.demand_id === dm.id)
-        .reduce((a, x) => a + x.taken_qty, 0),
+      : allocs.filter((a) => a.kind === 'plan')
+        .reduce((s, a) => s + a.qty, 0),
+    change: dm.change_qty != null ? dm.change_qty
+      : allocs.filter((a) => a.kind === 'change')
+        .reduce((s, a) => s + a.qty, 0),
+    taken,
     gap: dm.gap_total != null ? dm.gap_total
-      : (dm.qty - (dm.plan_qty || 0)) +
-        req.allocations.filter((a) => a.demand_id === dm.id
-          && (a.kind === 'gap' || a.status === 'gap'))
-          .reduce((a, x) => a + x.qty, 0),
+      : Math.max(0, dm.qty - taken),
   };
 }
 
@@ -1927,8 +1927,10 @@ function reqActiveNoneHtml() {
     ' <span class="stk-status st-' + st + '">' +
     (S.req_status_names[st] || st) + '</span></h2>' +
     '<p class="muted">' + esc(last.created_at) + ' · ' + last.n_allocs +
-    ' 个来源格 · 实取 ' + last.qty_taken + ' 枚' +
-    (last.n_gap ? ' · <span class="diff-up">缺口 ' + last.n_gap + ' 笔</span>' : '') +
+    ' 个来源格 · 锁定预留 ' + last.qty_reserved + ' · 实取 ' +
+    last.qty_taken + ' 枚' +
+    (last.qty_gap ? ' · <span class="diff-up">缺口 ' + last.qty_gap +
+      ' 枚</span>' : '') +
     '</p><div class="row"><button data-req-open="' + last.id + '">查看 / 打印</button>' +
     (st === 'done' && !last.returned_session_id
       ? '<button data-req-return="' + last.id + '" class="primary">一键带入归还流程</button>'
@@ -2041,10 +2043,12 @@ function reqPlanningHtml(req) {
   };
   const demands = req.demands.map((dm) => {
     const p = reqDemandProgress(req, dm);
+    // 规划页缺口列：尚未锁定到来源格的数量（需求 − 计划预留）
+    const planGap = Math.max(0, dm.qty - p.reserved);
     return '<tr><td class="big-char">' + esc(dm.char) + '</td>' +
       '<td>' + esc(dm.font || '任意') + ' / ' + esc(dm.size || '任意') + '</td>' +
       '<td>' + dm.qty + '</td><td>' + p.reserved + '</td>' +
-      '<td>' + (p.gap ? '<span class="diff-up">' + p.gap + '</span>' : '—') +
+      '<td>' + (planGap ? '<span class="diff-up">' + planGap + '</span>' : '—') +
       '</td><td>' + issueBadge(dm) +
       (dm.issue_text ? '<div class="muted">' + esc(dm.issue_text) + '</div>' : '') +
       '</td></tr>';
@@ -2417,12 +2421,14 @@ function renderReqHistory() {
     return;
   }
   el.innerHTML = '<table class="tasks"><thead><tr><th>#</th><th>名称</th><th>状态</th>' +
-    '<th>来源格</th><th>预留</th><th>实取</th><th>缺口</th><th>创建</th><th></th></tr></thead><tbody>' +
+    '<th>需求</th><th>来源格</th><th>锁定预留</th><th>实取</th><th>缺口</th>' +
+    '<th>创建</th><th></th></tr></thead><tbody>' +
     hist.map((r) =>
       '<tr><td>' + r.id + '</td><td>' + esc(r.name) + '</td><td>' +
-      (S.req_status_names[r.status] || r.status) + '</td><td>' + r.n_allocs +
+      (S.req_status_names[r.status] || r.status) + '</td><td>' +
+      (r.qty_demand != null ? r.qty_demand : '—') + '</td><td>' + r.n_allocs +
       '</td><td>' + r.qty_reserved + '</td><td>' + r.qty_taken + '</td><td>' +
-      (r.n_gap ? '<span class="diff-up">' + r.n_gap + '</span>' : '—') +
+      (r.qty_gap ? '<span class="diff-up">' + r.qty_gap + '</span>' : '—') +
       '</td><td class="muted">' + esc(r.created_at) + '</td><td>' +
       '<button data-req-open="' + r.id + '">查看</button> ' +
       '<button data-req-print="' + r.id + '">打印</button>' +
