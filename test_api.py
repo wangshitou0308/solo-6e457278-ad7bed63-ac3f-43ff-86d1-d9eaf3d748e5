@@ -519,9 +519,9 @@ def run_tests():
           str(res)[:200])
     call("POST", "/api/sessions/%d/abandon" % sid, {})
 
-    print("== 19. 备份 / 恢复（v2，保留字盘归属）==")
+    print("== 19. 备份 / 恢复（v3，保留字盘归属与盘点记录）==")
     # bk 在第 16 节开头、扫描码改动前留存
-    check("导出 v2 备份", bk["app"] == "sortify" and bk["version"] == 2)
+    check("导出 v3 备份", bk["app"] == "sortify" and bk["version"] == 3)
     check("备份含 trays 表", "trays" in bk["tables"]
           and len(bk["tables"]["trays"]) >= 2)
     check("格位备份带 tray_id", all("tray_id" in c
@@ -581,9 +581,387 @@ def run_tests():
         html = r.read().decode("utf-8")
     check("首页可访问", "铅字归还助手" in html)
     check("首页含换盘规划入口", "换盘" in html)
+    check("首页含实体盘点入口", "实体盘点" in html)
     for f in ("/static/app.js", "/static/style.css"):
         with urllib.request.urlopen(BASE + f) as r:
             check("静态资源 %s" % f, r.status == 200)
+
+    print("== 23. 实体盘点：锁盘、扫码续盘、差异复核、移格、入账 ==")
+    code, st = call("GET", "/api/state")
+    tr0 = st["trays"][0]
+    # 第 21 节的 v1 恢复后库里可能只有 V1A 一格：补齐本节目所需格位
+    have = {c["label"]: c for c in st["cells"] if c["tray_id"] == tr0["id"]}
+
+    def ensure_cell(label, ch, x, y):
+        if label in have:
+            return have[label]
+        r = call("POST", "/api/cells",
+                 {"tray_id": tr0["id"], "label": label, "char": ch,
+                  "x": x, "y": y})
+        return next(c for c in r[1]["state"]["cells"]
+                    if c["tray_id"] == tr0["id"] and c["label"] == label)
+
+    sa = ensure_cell("A1", "的", 20, 20)
+    sb = ensure_cell("A2", "一", 74, 20)
+    sc = ensure_cell("A3", "中", 128, 20)
+    ensure_cell("G7", "", 20, 400)
+    cs = [c for c in call("GET", "/api/state")[1]["cells"]
+          if c["tray_id"] == tr0["id"]]
+    # 构造账面：A1 的 20、A2 一 20、A3 中 30
+    call("PUT", "/api/cells/%d" % sa["id"],
+         {"char": "的", "font": "宋体", "size": "五号", "qty": 20})
+    call("PUT", "/api/cells/%d" % sb["id"],
+         {"char": "一", "font": "宋体", "size": "五号", "qty": 20})
+    call("PUT", "/api/cells/%d" % sc["id"],
+         {"char": "中", "font": "宋体", "size": "五号", "qty": 30})
+    # 未知码不能开始；重复开始被拒
+    code, res = call("POST", "/api/stocktakes", {"scan_code": "NO-SUCH"})
+    check("未知字盘码不能开始盘点", code == 400)
+    code, res = call("POST", "/api/stocktakes", {"scan_code": tr0["scan_code"]})
+    check("扫描字盘码开始盘点", res.get("ok"), str(res)[:150])
+    stock_id = res["stocktake_id"]
+    code, _ = call("POST", "/api/stocktakes", {"scan_code": tr0["scan_code"]})
+    check("同一字盘不能重复开盘点单", code == 400)
+    # 盘点期间锁住该盘归还确认与存量编辑 / 新建格位
+    code, _ = call("PUT", "/api/cells/%d" % sa["id"], {"qty": 21})
+    check("盘点中存量编辑被锁", code == 400)
+    code, _ = call("POST", "/api/cells",
+                   {"tray_id": tr0["id"], "label": "ZZ9"})
+    check("盘点中新建格位被锁", code == 400)
+    # 另一个字盘不被影响
+    code, res = call("POST", "/api/trays", {"name": "盘点外盘",
+                                            "scan_code": "TRAY-STK"})
+    other_t = res["tray_id"]
+    code, _ = call("POST", "/api/cells",
+                   {"tray_id": other_t, "label": "Q1", "char": "甲"})
+    check("其他字盘的编辑不受盘点锁影响", code == 200)
+    # 归还确认被锁：建一个落在此盘的批次锁定后到执行态
+    call("POST", "/api/sessions", {"text": "的 1"})
+    code, st2 = call("GET", "/api/state")
+    lock_sid = st2["session"]["id"]
+    o = st2["session"]["tray_order"]
+    call("POST", "/api/sessions/%d/plan" % lock_sid,
+         {"tray_order": o, "start_tray_id": o[0], "lock": True})
+    code, st2 = call("GET", "/api/state")
+    st2 = confirm_gate(st2)
+    lock_task = next(t for t in st2["session"]["tasks"]
+                     if t["status"] == "active")
+    code, res = call("POST", "/api/tasks/%d/confirm" % lock_task["id"], {})
+    check("盘点中该盘归还确认被锁", code == 400 and "盘点" in res.get("error", ""),
+          str(res)[:150])
+    call("POST", "/api/sessions/%d/abandon" % lock_sid, {})
+
+    # 按蛇形顺序逐格盘点；制造差异：
+    #  A1：实物 18 枚且整格规格为「一」（账面 的20 全缺、实物 一18 溢出）
+    #  A2：实物 18（一 缺2）→ 与 A1 的溢出配出错放 P1（一 2 枚 A1→A2）
+    #  A3：实物 28（中 缺2，纯盘亏）；G7 暂时不能盘
+    sk = call("GET", "/api/stocktakes/%d" % stock_id)[1]["stocktake"]
+    check("盘点单含全部格位快照", sk["total"] == len(cs),
+          "%d/%d" % (sk["total"], len(cs)))
+    check("刷新后可恢复盘点单与进度", sk["n_pending"] == sk["total"])
+    blocked = next(c for c in sk["cells"] if c["cell_label"] == "G7")
+    guard = 0
+    while True:
+        sk = call("GET", "/api/stocktakes/%d" % stock_id)[1]["stocktake"]
+        if sk["status"] != "counting":
+            break
+        cur = next(c for c in sk["cells"] if c["status"] == "pending")
+        if cur["id"] == blocked["id"]:
+            body = {"label": "G7", "flag": "blocked"}
+        elif cur["cell_label"] == "A1":
+            body = {"label": "A1", "qty": 18, "actual_char": "一"}
+        elif cur["cell_label"] == "A2":
+            body = {"label": "A2", "qty": 18}
+        elif cur["cell_label"] == "A3":
+            body = {"label": "A3", "qty": 28}
+        else:
+            body = {"label": cur["cell_label"], "qty": cur["book_qty"]}
+        code, res = call("POST", "/api/stocktakes/%d/count" % stock_id, body)
+        if not res.get("ok"):
+            check("逐格录入 " + cur["cell_label"], False, str(res)[:150])
+            break
+        guard += 1
+        if guard > 100:
+            break
+    sk = call("GET", "/api/stocktakes/%d" % stock_id)[1]["stocktake"]
+    check("全盘录完进入差异复核", sk["status"] == "reviewing", sk["status"])
+    # 扫码校验：盘内扫错格 / 缺数量被拦（已复核态，复盘时才扫；此处用撤销回到 A1 之后）
+    call("POST", "/api/stocktakes/%d/undo-count" % stock_id, {})
+    code, st2 = call("GET", "/api/state")
+    sk = next(x for x in st2["stocktakes"] if x["id"] == stock_id)
+    check("撤销上一格回到盘点中", sk["status"] == "counting")
+    cur = next(c for c in sk["cells"] if c["status"] == "pending")
+    code, res = call("POST", "/api/stocktakes/%d/count" % stock_id,
+                     {"label": "A1", "qty": cur["book_qty"]})
+    check("盘内扫错格拦截（count_mismatch）",
+          not res.get("ok") and res["conflict"]["type"] == "count_mismatch",
+          str(res)[:150])
+    # 重新录入正确格
+    code, res = call("POST", "/api/stocktakes/%d/count" % stock_id,
+                     {"label": cur["cell_label"], "qty": cur["book_qty"]})
+    check("正确格录入成功", res.get("ok"), str(res)[:150])
+    sk = call("GET", "/api/stocktakes/%d" % stock_id)[1]["stocktake"]
+    check("再次进入复核", sk["status"] == "reviewing")
+
+    # 把 A3 拉回复盘并标记为“混字”，构造待复核项（有决议时复盘应先被拦）
+    rc = sc
+    loss_d = next((d for d in sk["discrepancies"]
+                   if d["cell_id"] == sc["id"] and d["kind"] == "short"), None)
+    if loss_d:
+        call("POST", "/api/discrepancies/%d/decide" % loss_d["id"],
+             {"decision": "loss"})
+        code, res = call("POST", "/api/stocktakes/%d/recheck" % stock_id,
+                         {"cell_id": rc["id"]})
+        check("已有盘亏决议时复盘被拦", code == 400)
+        call("POST", "/api/discrepancies/%d/revoke" % loss_d["id"], {})
+    code, res = call("POST", "/api/stocktakes/%d/recheck" % stock_id,
+                     {"cell_id": rc["id"]})
+    check("差异复核阶段可把格拉回复盘", res.get("ok"), str(res)[:150])
+    code, st2 = call("GET", "/api/state")
+    sk = next(x for x in st2["stocktakes"] if x["id"] == stock_id)
+    check("复盘后差异清空、回到盘点中", sk["status"] == "counting"
+          and len(sk["discrepancies"]) == 0)
+    cur = next(c for c in sk["cells"] if c["status"] == "pending")
+    # 标记混字（待复核），其他格保持账面，重新进入复核
+    code, res = call("POST", "/api/stocktakes/%d/count" % stock_id,
+                     {"label": cur["cell_label"], "flag": "mixed", "qty": 28})
+    check("混字格录入成功并列为待复核", res.get("ok"), str(res)[:150])
+    sk = call("GET", "/api/stocktakes/%d" % stock_id)[1]["stocktake"]
+    check("复盘完成重新生成差异（含待复核项）", sk["status"] == "reviewing"
+          and any(d["kind"] == "review" and d["review_kind"] == "mixed"
+                  for d in sk["discrepancies"]), str(sk["discrepancies"])[:200])
+
+    check("A1 账面规格短缺 + 实物规格溢出",
+          {d["kind"] for d in a1_discs} == {"short", "surplus"}
+          and any(d["spec_char"] == "一" for d in a1_discs),
+          str([(d["kind"], d["spec_char"], d["qty"]) for d in a1_discs]))
+    check("A2 记录短缺", any(d["kind"] == "short" for d in a2_discs))
+    check("A3 中 短缺 2 枚",
+          any(d["kind"] == "short" and d["spec_char"] == "中" and d["qty"] == 2
+              for d in a3_discs))
+    check("G7 列为待复核", any(d["kind"] == "review"
+                               and d["review_kind"] == "blocked"
+                               for d in sk["discrepancies"]))
+    check("同规格相反差额配出错放候选（不自动改库存）",
+          len(sk["pairs"]) == 1 and sk["pairs"][0]["src_label"] == "A1"
+          and sk["pairs"][0]["dst_label"] == "A2"
+          and sk["pairs"][0]["spec_char"] == "一"
+          and sk["pairs"][0]["qty"] == 2, str(sk["pairs"]))
+    # 库存未变
+    code, st2 = call("GET", "/api/state")
+    cur_a1 = next(c for c in st2["cells"] if c["id"] == sa["id"])
+    check("配对 / 复核阶段库存未被自动修改", cur_a1["qty"] == 20)
+    # 待复核存在 → 不能入账
+    code, res = call("POST", "/api/stocktakes/%d/post" % stock_id, {})
+    check("有待复核格时不能入账", code == 400)
+    # 有决议时复盘被拦
+    loss_d = next(d for d in a3_discs if d["kind"] == "short")
+    call("POST", "/api/discrepancies/%d/decide" % loss_d["id"],
+         {"decision": "loss"})
+    code, res = call("POST", "/api/stocktakes/%d/recheck" % stock_id,
+                     {"cell_id": rc["cell_id"]})
+    check("已有盘盈 / 盘亏决议时复盘被拦", code == 400)
+    call("POST", "/api/discrepancies/%d/revoke" % loss_d["id"], {})
+    code, res = call("POST", "/api/stocktakes/%d/recheck" % stock_id,
+                     {"cell_id": rc["cell_id"]})
+    check("撤销决议后可复盘待复核格", res.get("ok"), str(res)[:150])
+    code, st2 = call("GET", "/api/state")
+    sk = next(x for x in st2["stocktakes"] if x["id"] == stock_id)
+    check("复盘后差异清空、回到盘点中", sk["status"] == "counting"
+          and len(sk["discrepancies"]) == 0)
+    cur = next(c for c in sk["cells"] if c["status"] == "pending")
+    call("POST", "/api/stocktakes/%d/count" % stock_id,
+         {"label": cur["cell_label"], "qty": cur["book_qty"]})
+    sk = call("GET", "/api/stocktakes/%d" % stock_id)[1]["stocktake"]
+    check("复盘完成重新生成差异", sk["status"] == "reviewing"
+          and len(sk["pairs"]) == 1)
+
+    # 决议方向校验
+    a3_short = next(d for d in sk["discrepancies"]
+                    if d["cell_id"] == sc["id"] and d["kind"] == "short")
+    code, _ = call("POST", "/api/discrepancies/%d/decide" % a3_short["id"],
+                   {"decision": "gain"})
+    check("短缺项不能认定盘盈", code == 400)
+    # 待复核项不能认定盘盈 / 盘亏
+    rv = next(d for d in sk["discrepancies"] if d["kind"] == "review")
+    code, _ = call("POST", "/api/discrepancies/%d/decide" % rv["id"],
+                   {"decision": "loss"})
+    check("待复核项不能直接盘亏", code == 400)
+    call("POST", "/api/discrepancies/%d/decide" % a3_short["id"],
+         {"decision": "loss"})
+    # A1 实物「一」溢出 18，其中 2 枚由错放处理，余 16 认定盘盈
+    a1_surplus = next(d for d in sk["discrepancies"]
+                      if d["cell_id"] == sa["id"] and d["kind"] == "surplus")
+    call("POST", "/api/discrepancies/%d/decide" % a1_surplus["id"],
+         {"decision": "gain"})
+    # A1 账面「的」短缺 20 认定盘亏
+    a1_book_short = next(d for d in sk["discrepancies"]
+                         if d["cell_id"] == sa["id"] and d["kind"] == "short")
+    call("POST", "/api/discrepancies/%d/decide" % a1_book_short["id"],
+         {"decision": "loss"})
+
+    # 候选未处理时不能入账
+    code, res = call("POST", "/api/stocktakes/%d/post" % stock_id, {})
+    check("错放候选未处理不能入账", code == 400)
+    # 生成移格任务并依次复扫两端
+    pair = sk["pairs"][0]
+    code, res = call("POST", "/api/pairs/%d/move" % pair["id"], {})
+    check("错放候选生成移格任务", res.get("ok") and res["move_task_id"],
+          str(res)[:150])
+    mid = res["move_task_id"]
+    sk = call("GET", "/api/stocktakes/%d" % stock_id)[1]["stocktake"]
+    mv = next(m for m in sk["move_tasks"] if m["id"] == mid)
+    # 顺序错误：先扫目标格
+    code, res = call("POST", "/api/move-tasks/%d/scan" % mid,
+                     {"label": mv["target_label"]})
+    check("移格先扫目标格被拦（move_wrong_cell）",
+          not res.get("ok") and
+          res["conflict"]["type"] == "move_wrong_cell", str(res)[:150])
+    code, res = call("POST", "/api/move-tasks/%d/scan" % mid,
+                     {"label": "ZZ-NOPE"})
+    check("移格扫未知格号被拦",
+          not res.get("ok") and
+          res["conflict"]["type"] == "move_unknown")
+    code, res = call("POST", "/api/move-tasks/%d/scan" % mid,
+                     {"label": mv["source_label"]})
+    check("复扫来源格通过", res.get("ok") and res["stage_done"] == "source")
+    code, res = call("POST", "/api/move-tasks/%d/scan" % mid,
+                     {"label": mv["source_label"]})
+    check("第二端仍扫来源格被拦",
+          not res.get("ok") and
+          res["conflict"]["type"] == "move_wrong_cell")
+    code, res = call("POST", "/api/move-tasks/%d/scan" % mid,
+                     {"label": mv["target_label"]})
+    check("复扫目标格通过（仍不改库存）",
+          res.get("ok") and res["stage_done"] == "target")
+    code, st2 = call("GET", "/api/state")
+    cur_a1 = next(c for c in st2["cells"] if c["id"] == sa["id"])
+    check("移格双端复扫完成、入账前库存不动", cur_a1["qty"] == 20)
+    # 预览：入账前后值
+    sk = next(x for x in st2["stocktakes"] if x["id"] == stock_id)
+    check("预览就绪", sk["preview"]["ready"], str(sk["preview"]["errors"]))
+    chg = {c["label"]: c for c in sk["preview"]["changes"]}
+    check("预览 A1 入账后 16、A2 入账后 20",
+          chg["A1"]["final_qty"] == 16 and chg["A2"]["final_qty"] == 20
+          and chg["A1"]["move_out"] == 2 and chg["A2"]["move_in"] == 2,
+          str({k: (v["final_qty"], v["move_out"], v["move_in"])
+               for k, v in chg.items()}))
+
+    # 入账前可撤销移格（取消任务，候选恢复）
+    # 直接入账主流程；撤销路径另验
+    code, res = call("POST", "/api/stocktakes/%d/post" % stock_id, {})
+    check("一次性入账成功", res.get("ok"), str(res)[:200])
+    st2 = res["state"]
+    fa1 = next(c for c in st2["cells"] if c["id"] == sa["id"])
+    fa2 = next(c for c in st2["cells"] if c["id"] == sb["id"])
+    fa3 = next(c for c in st2["cells"] if c["id"] == sc["id"])
+    check("入账后 A1=16（一）、A2=20（一）、A3=28（中，盘亏2）",
+          fa1["qty"] == 16 and fa1["char"] == "一" and fa2["qty"] == 20
+          and fa2["char"] == "一" and fa3["qty"] == 28,
+          "%s/%s/%s" % ((fa1["char"], fa1["qty"]), (fa2["char"], fa2["qty"]),
+                        (fa3["char"], fa3["qty"])))
+    check("入账后盘锁解除，可编辑",
+          call("PUT", "/api/cells/%d" % sa["id"], {"qty": 16})[0] == 200)
+    sk = call("GET", "/api/stocktakes/%d" % stock_id)[1]["stocktake"]
+    check("盘点单状态 posted 并保留前后值",
+          sk["status"] == "posted" and sk["postings"] and
+          any(p["kind"] == "move_out" and p["before_qty"] == 18
+              and p["after_qty"] == 16 for p in sk["postings"])
+          and any(p["kind"] == "move_in" and p["after_qty"] == 20
+                  for p in sk["postings"]),
+          str([(p["kind"], p["before_qty"], p["after_qty"])
+               for p in sk["postings"]]))
+    code, _ = call("POST", "/api/discrepancies/%d/revoke" % a1_surplus["id"],
+                   {})
+    check("入账后决议不可撤销", code == 400)
+    check("入账盘点单进入历史概要",
+          any(h["id"] == stock_id and h["status"] == "posted"
+              for h in st2["stocktake_history"]))
+    check("备份包含盘点记录与任务进度",
+          bk["version"] >= 3 and len(bk["tables"]["stocktakes"]) >= 1
+          and len(bk["tables"]["stocktake_cells"]) >= len(cs)
+          and any(r["status"] == "posted"
+                  for r in bk["tables"]["move_tasks"])
+          and len(bk["tables"]["postings"]) >= 4)
+
+    print("== 24. 盘点：未入账决议撤销 / 核销候选 / 取消盘点单 ==")
+    code, res = call("POST", "/api/stocktakes", {"scan_code": "TRAY-STK"})
+    sid2 = res["stocktake_id"]
+    sk = call("GET", "/api/stocktakes/%d" % sid2)[1]["stocktake"]
+    q1 = next(c for c in sk["cells"] if c["cell_label"] == "Q1")
+    call("POST", "/api/stocktakes/%d/count" % sid2,
+         {"label": "Q1", "qty": q1["book_qty"] + 3})  # 纯溢出 3
+    sk = call("GET", "/api/stocktakes/%d" % sid2)[1]["stocktake"]
+    check("单格纯溢出进入复核", sk["status"] == "reviewing"
+          and any(d["kind"] == "surplus" and d["qty"] == 3
+                  for d in sk["discrepancies"]))
+    d_sur = next(d for d in sk["discrepancies"] if d["kind"] == "surplus")
+    call("POST", "/api/discrepancies/%d/decide" % d_sur["id"],
+         {"decision": "gain"})
+    code, res = call("POST", "/api/discrepancies/%d/revoke" % d_sur["id"], {})
+    check("未入账盘盈决议可撤销", res.get("ok"))
+    code, res = call("POST", "/api/stocktakes/%d/cancel" % sid2, {})
+    check("有未入账决议时仍可取消盘点单（盘锁解除）", res.get("ok"),
+          str(res)[:150])
+    code, st2 = call("GET", "/api/state")
+    check("取消后该盘可立即编辑",
+          call("POST", "/api/cells",
+               {"tray_id": other_t, "label": "Q2", "char": "乙"})[0] == 200)
+    check("取消的盘点单进入历史且不再活动",
+          all(x["id"] != sid2 for x in st2["stocktakes"])
+          and any(h["id"] == sid2 and h["status"] == "cancelled"
+                  for h in st2["stocktake_history"]))
+
+    # 错放候选核销路径：A1/A2 再开一盘，选“不移动，核销”
+    code, res = call("POST", "/api/stocktakes", {"scan_code": tr0["scan_code"]})
+    sid3 = res["stocktake_id"]
+    sk = call("GET", "/api/stocktakes/%d" % sid3)[1]["stocktake"]
+    while True:
+        sk = call("GET", "/api/stocktakes/%d" % sid3)[1]["stocktake"]
+        if sk["status"] != "counting":
+            break
+        cur = next(c for c in sk["cells"] if c["status"] == "pending")
+        if cur["cell_label"] == "A1":
+            body = {"label": "A1", "qty": fa1["qty"] - 2, "actual_char": "一"}
+        elif cur["cell_label"] == "A2":
+            body = {"label": "A2", "qty": fa2["qty"] - 2}
+        else:
+            body = {"label": cur["cell_label"], "qty": cur["book_qty"]}
+        code, res = call("POST", "/api/stocktakes/%d/count" % sid3, body)
+        if not res.get("ok"):
+            check("核销流程逐格录入", False, str(res)[:150])
+            break
+    sk = call("GET", "/api/stocktakes/%d" % sid3)[1]["stocktake"]
+    check("核销流程仍配出错放候选", len(sk["pairs"]) == 1, str(sk["pairs"]))
+    # 其余非候选差异认定
+    for d in sk["discrepancies"]:
+        cov = sum(p["qty"] for p in sk["pairs"]
+                  if d["id"] in (p["src_disc_id"], p["dst_disc_id"]))
+        if d["kind"] == "surplus" and d["qty"] - cov > 0:
+            call("POST", "/api/discrepancies/%d/decide" % d["id"],
+                 {"decision": "gain"})
+        if d["kind"] == "short" and d["qty"] - cov > 0:
+            call("POST", "/api/discrepancies/%d/decide" % d["id"],
+                 {"decision": "loss"})
+    code, res = call("POST", "/api/pairs/%d/writeoff" % sk["pairs"][0]["id"], {})
+    check("候选可核销为盘盈 / 盘亏", res.get("ok"), str(res)[:150])
+    sk = call("GET", "/api/stocktakes/%d" % sid3)[1]["stocktake"]
+    check("核销后预览可入账（无待处理候选）", sk["preview"]["ready"],
+          str(sk["preview"]["errors"]))
+    code, res = call("POST", "/api/stocktakes/%d/post" % sid3, {})
+    check("核销盘点单可入账", res.get("ok"), str(res)[:150])
+
+    print("== 25. 恢复盘点备份（v3 往返）==")
+    bk3 = call("GET", "/api/backup")[1]
+    code, res = call("POST", "/api/restore", bk3)
+    check("v3 备份恢复成功", res.get("ok"), str(res)[:150])
+    hist = res["state"]["stocktake_history"]
+    check("恢复后保留入账盘点单与快照",
+          any(h["id"] == stock_id and h["status"] == "posted" for h in hist))
+    det = call("GET", "/api/stocktakes/%d" % stock_id)[1]["stocktake"]
+    check("恢复后仍可查看入账前后值",
+          det["status"] == "posted" and len(det["postings"]) >= 4
+          and len(det["cells"]) == len(cs))
 
 
 if __name__ == "__main__":

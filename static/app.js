@@ -2,7 +2,8 @@
 /* 铅字归还助手 —— 前端逻辑（原生 JS + SVG，多字盘换盘导航） */
 
 let S = { trays: [], cells: [], session: null, last_done: null, pending: [],
-          conflicts: {}, reason_names: {} };
+          conflicts: {}, reason_names: {},
+          stocktakes: [], stocktake_history: [] };
 let view = 'run';
 let editTrayId = null;       // 字盘编辑页当前选中的字盘
 let startTrayId = null;      // 规划页选择的起始盘（本地草稿）
@@ -112,6 +113,16 @@ function drawTray(svg, cells, opts) {
         x: c.x + c.w / 2, y: c.y + c.h - 5, 'class': 'cell-remain',
       }, g);
       b.textContent = '余' + opts.remain.get(c.id);
+    }
+    if (opts.sub) {
+      const sub = opts.sub(c);
+      if (sub) {
+        const s = svgEl('text', {
+          x: c.x + c.w - 3, y: c.y + 10,
+          'class': 'cell-sub ' + (sub.cls || ''), 'text-anchor': 'end',
+        }, g);
+        s.textContent = sub.text;
+      }
     }
     if (opts.onClick) {
       g.addEventListener('click', () => {
@@ -1028,6 +1039,17 @@ function bindData() {
   });
   // 无进行中批次时，补打最近完成批次的标签
   $('#btnPrint').onclick = () => printLabels(S.session || S.last_done);
+  $('#btnPrintStock').onclick = () => guard(async () => {
+    let st = (S.stocktakes || [])[0];
+    if (!st) {
+      const h = (S.stocktake_history || [])[0];
+      if (h) {
+        st = (await api('/api/stocktakes/' + h.id)).stocktake;
+      }
+    }
+    if (!st) { toast('没有可打印差异单的盘点单', true); return; }
+    printStockSheet(st);
+  });
 }
 
 /* ---------------- 作业页绑定 ---------------- */
@@ -1109,6 +1131,678 @@ function bindRun() {
   });
 }
 
+/* ---------------- 实体盘点 ---------------- */
+
+let stockSelId = null;        // 盘点页当前打开的盘点单
+let stockConflict = null;     // 盘点扫码冲突
+let moveStageCtx = null;      // 移格复扫面板上下文 {taskId, inputVal}
+
+const stockById = (id) =>
+  (S.stocktakes || []).find((x) => x.id === id) || null;
+
+function stockName(st, field) {
+  const map = S.stock_status_names || {};
+  return map[st[field]] || st[field];
+}
+const discName = (k) => (S.disc_kind_names || {})[k] || k;
+const reviewName = (k) => (S.review_names || {})[k] || k;
+const countName = (k) => (S.count_status_names || {})[k] || k;
+const specText = (ch, font, size) =>
+  (ch || '（空）') + ' ' + (font || '—') + ' ' + (size || '—');
+
+function renderStock() {
+  const list = S.stocktakes || [];
+  const hist = S.stocktake_history || [];
+  $('#stockBadge').hidden = list.length === 0;
+  $('#stockBadge').textContent = list.length;
+  if (!stockById(stockSelId)) {
+    stockSelId = list.length ? list[0].id : (hist.length ? null : null);
+  }
+  // 进行中盘点单卡片
+  $('#stockActiveList').innerHTML = list.length
+    ? list.map((st) =>
+      '<div class="stock-item' + (st.id === stockSelId ? ' sel' : '') + '">' +
+      '<div><b>' + esc(st.tray_name) + '</b> ' +
+      '<span class="mono dim">' + esc(st.tray_code || '—') + '</span> ' +
+      '<span class="stk-status st-' + st.status + '">' +
+      stockName(st, 'status') + '</span></div>' +
+      '<div class="muted">盘点单 #' + st.id + ' · ' + st.n_counted + '/' +
+      st.total + ' 格 · 待复核 ' + st.n_flagged +
+      ' · 开始 ' + esc(st.started_at) + '</div>' +
+      '<div class="row"><button data-open="' + st.id + '"' +
+      (st.id === stockSelId ? ' class="primary"' : '') + '>' +
+      (st.id === stockSelId ? '正在查看' : '进入盘点') + '</button></div></div>'
+    ).join('')
+    : '<p class="hint">当前没有进行中的盘点单。</p>';
+  $('#stockActiveList').querySelectorAll('[data-open]').forEach((b) => {
+    b.onclick = () => {
+      stockSelId = parseInt(b.dataset.open, 10);
+      stockConflict = null;
+      renderAll();
+    };
+  });
+  // 历史
+  $('#stockHistory').innerHTML = hist.length
+    ? '<table class="tasks"><thead><tr><th>#</th><th>字盘</th><th>状态</th>' +
+      '<th>进度</th><th>开始</th><th>入账</th><th></th></tr></thead><tbody>' +
+      hist.map((st) =>
+      '<tr><td>' + st.id + '</td><td>' + esc(st.tray_name) +
+      ' <span class="mono dim">' + esc(st.tray_code || '—') + '</span></td>' +
+      '<td>' + stockName(st, 'status') + '</td><td>' + st.n_counted + '/' +
+      st.total + '</td><td class="muted">' + esc(st.started_at) +
+      '</td><td class="muted">' + esc(st.posted_at || '—') + '</td>' +
+      '<td>' + (st.status === 'posted'
+        ? '<button data-detail="' + st.id + '">查看入账</button>'
+        : '<button data-detail="' + st.id + '">查看</button>') +
+      ' <button data-print="' + st.id + '">打印差异单</button></td></tr>').join('')
+      + '</tbody></table>'
+    : '<p class="hint">暂无历史盘点单。</p>';
+  $('#stockHistory').querySelectorAll('[data-detail]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      const res = await api('/api/stocktakes/' + b.dataset.detail);
+      stockSelId = res.stocktake.id;
+      stockConflict = null;
+      renderStockWork(res.stocktake);
+      $('#stockWork').scrollIntoView({ behavior: 'smooth' });
+    });
+  });
+  $('#stockHistory').querySelectorAll('[data-print]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      const res = await api('/api/stocktakes/' + b.dataset.print);
+      printStockSheet(res.stocktake);
+    });
+  });
+  // 工作台
+  const st = stockById(stockSelId);
+  const work = $('#stockWork');
+  if (st) {
+    work.hidden = false;
+    renderStockWork(st);
+  } else {
+    work.hidden = true;
+    work.innerHTML = '';
+  }
+}
+
+function renderStockWork(st) {
+  const work = $('#stockWork');
+  if (st.status === 'counting') work.innerHTML = stockCountingHtml(st);
+  else if (st.status === 'reviewing') work.innerHTML = stockReviewHtml(st);
+  else work.innerHTML = stockFinishedHtml(st);
+  bindStockWork(st);
+}
+
+/* ---- 盘点中 ---- */
+
+function stockCountingHtml(st) {
+  const cur = st.cells.find((c) => c.status === 'pending');
+  const done = st.cells.filter((c) => c.status !== 'pending').length;
+  return '<div class="stock-layout">' +
+    '<div class="tray-wrap panel"><div class="tray-titlebar">' +
+    '<h2>盘点：' + esc(st.tray_name) + '</h2>' +
+    '<span class="mono muted">' + esc(st.tray_code) + ' · 盘点单 #' + st.id +
+    '</span></div>' + stockSvgBlock(st, cur) +
+    '<div class="legend"><span><i class="sw sw-stock-cur"></i>当前待盘</span>' +
+    '<span><i class="sw sw-stock-done"></i>已盘</span>' +
+    '<span><i class="sw sw-stock-flag"></i>待复核</span></div></div>' +
+    '<div class="stock-side">' +
+    '<div class="panel"><div class="row between"><h3>盘点进度</h3>' +
+    '<span class="muted">' + done + '/' + st.total + '</span></div>' +
+    '<div class="progress"><div style="width:' + (st.total ? done / st.total * 100 : 0) +
+      '%;height:100%;background:var(--done)"></div></div>' +
+    (cur
+      ? '<div class="cur-task"><div class="cur-char">' +
+        esc(cur.book_char || '空') + '</div>' +
+        '<div class="cur-meta"><div>第 <b>' + cur.seq + '</b> 格 · 格号 <b>' +
+        esc(cur.book_label) + '</b></div><div>账面：' +
+        esc(specText(cur.book_char, cur.book_font, cur.book_size)) +
+        ' · <b>' + cur.book_qty + '</b> 枚</div></div></div>' +
+        '<label class="stock-field">扫描格号 / 输入当前格号' +
+        '<input id="scLabel" autocomplete="off" class="mono" value="' +
+        esc(cur.book_label) + '" placeholder="扫到当前高亮格号"></label>' +
+        '<label class="stock-field">实物点数' +
+        '<input id="scQty" type="number" min="0" placeholder="实数，如 18"></label>' +
+        '<details class="spec-details"><summary>字符 / 字体 / 字号与账面不符？录入实物规格</summary>' +
+        '<div class="form" style="margin-top:.4rem">' +
+        '<label>实物字符 <input id="scChar" maxlength="4" placeholder="留空=与账面一致"></label>' +
+        '<label>实物字体 <input id="scFont" placeholder="留空=同账面"></label>' +
+        '<label>实物字号 <input id="scSize" placeholder="留空=同账面"></label>' +
+        '</div></details>' +
+        '<div class="row"><button id="btnScSubmit" class="primary">录入本格</button></div>' +
+        '<div class="row">' +
+        '<button data-flag="mixed">混字待复核</button>' +
+        '<button data-flag="unrecognized">无法辨认</button>' +
+        '<button data-flag="blocked">暂时不能盘</button></div>' +
+        '<div class="row"><button id="btnScUndo">撤销上一格</button>' +
+        '<button id="btnScCancel" class="danger">取消盘点单</button></div>'
+      : '<p class="hint">全部格位已录入，正在生成差异…</p>') +
+    '<div id="stockConflict"></div></div>' +
+    '<div class="panel"><h3>已盘 / 待复核</h3>' + stockCountedList(st) + '</div>' +
+    '</div></div>';
+}
+
+function stockSvgBlock(st, curCell) {
+  return '<svg id="stockTray" class="tray" role="img" aria-label="盘点字盘"></svg>';
+}
+
+function stockCountedList(st) {
+  const recent = st.cells.filter((c) => c.status !== 'pending')
+    .slice(-12).reverse();
+  if (!recent.length) return '<p class="hint">尚无录入。</p>';
+  return '<div class="stock-donelist">' + recent.map((c) =>
+    '<div class="stock-done stk-' + c.status + '"><b>' + esc(c.cell_label) +
+    '</b> ' + (c.status === 'counted'
+      ? (c.actual_qty + ' 枚' +
+         ((c.actual_char !== c.book_char || c.actual_font !== c.book_font ||
+           c.actual_size !== c.book_size)
+          ? ' · <span class="diff-up">规格不符：' +
+            esc(specText(c.actual_char, c.actual_font, c.actual_size)) + '</span>'
+          : ''))
+      : '<span class="diff-up">' + countName(c.status) + '</span>') +
+    '</div>').join('') + '</div>';
+}
+
+/* ---- 差异复核 ---- */
+
+function stockDiscMap(st) {
+  // 每格：review 项 + short/surplus 项；配对覆盖数量
+  const byCell = {};
+  for (const d of st.discrepancies) {
+    (byCell[d.cell_id] = byCell[d.cell_id] || []).push(d);
+  }
+  const covered = {};
+  for (const p of st.pairs) {
+    if (p.status === 'candidate') continue;
+    covered[p.src_disc_id] = (covered[p.src_disc_id] || 0) + p.qty;
+    covered[p.dst_disc_id] = (covered[p.dst_disc_id] || 0) + p.qty;
+  }
+  return { byCell, covered };
+}
+
+function stockReviewHtml(st) {
+  const { byCell, covered } = stockDiscMap(st);
+  const pairs = st.pairs;
+  const moves = st.move_tasks;
+  const pv = st.preview || { changes: [], errors: [], ready: false };
+  const nDisc = st.discrepancies.length;
+  let body = '';
+  if (!nDisc) {
+    body = '<div class="panel"><h3>账实相符</h3>' +
+      '<p class="hint">全盘格位账面与实物一致，可以直接入账（不改变存量）。</p>' +
+      '<div class="row"><button id="btnScPost" class="primary">一次性入账</button>' +
+      '<button id="btnScCancel" class="danger">取消盘点单</button></div></div>';
+  } else {
+    body += '<div class="panel"><h3>差异预览（入账前）</h3>' +
+      '<div id="stockPreview">' + stockPreviewHtml(st, pv) + '</div>' +
+      '<div class="row">' +
+      '<button id="btnScPost" class="primary" ' + (pv.ready ? '' : 'disabled') +
+      '>一次性入账</button>' +
+      '<button id="btnScPrint">打印差异单</button>' +
+      '<button id="btnScCancel" class="danger">取消盘点单</button></div></div>';
+    if (pairs.length) {
+      body += '<div class="panel"><h3>错放候选（同规格跨格相反差额，不自动改库存）</h3>' +
+        stockPairsHtml(st, pairs, moves) + '</div>';
+    }
+    body += '<div class="panel"><h3>按格差异：短缺 / 溢出 / 待复核</h3>' +
+      '<table class="tasks"><thead><tr><th>格号</th><th>账面</th><th>实物</th>' +
+      '<th>差异</th><th>处理</th></tr></thead><tbody>' +
+      st.cells.filter((c) => byCell[c.cell_id]).map((c) => {
+        const ds = byCell[c.cell_id];
+        const diffHtml = ds.map((d) => {
+          if (d.kind === 'review') {
+            return '<div class="diff-up">待复核：' + reviewName(d.review_kind) +
+              '</div>';
+          }
+          const cov = covered[d.id] || 0;
+          const res = d.qty - cov;
+          return '<div class="' + (d.kind === 'short' ? 'diff-up' : 'diff-ok') +
+            '">' + discName(d.kind) + ' ' + esc(specText(d.spec_char, d.spec_font,
+            d.spec_size)) + ' ' + d.qty + ' 枚' +
+            (cov ? '（错放/核销 ' + cov + '，余 ' + Math.max(res, 0) + '）' : '') +
+            (d.decision ? ' <b>→ ' + (d.decision === 'gain' ? '盘盈' : '盘亏') +
+              '</b>' : '') + '</div>';
+        }).join('');
+        return '<tr><td><b>' + esc(c.cell_label) + '</b></td>' +
+          '<td>' + esc(specText(c.book_char, c.book_font, c.book_size)) + '<br>' +
+          c.book_qty + ' 枚</td>' +
+          '<td>' + (c.status === 'counted'
+            ? esc(specText(c.actual_char, c.actual_font, c.actual_size)) + '<br>' +
+              c.actual_qty + ' 枚'
+            : '<span class="diff-up">' + countName(c.status) + '</span>') + '</td>' +
+          '<td>' + diffHtml + '</td>' +
+          '<td>' + stockDiscActionsHtml(c, ds, covered) + '</td></tr>';
+      }).join('') + '</tbody></table></div>';
+  }
+  return '<div class="stock-review">' + body + '</div>';
+}
+
+function stockDiscActionsHtml(c, ds, covered) {
+  return ds.map((d) => {
+    if (d.kind === 'review') {
+      return '<button data-recheck="' + c.cell_id + '">复盘该格</button>';
+    }
+    const res = d.qty - (covered[d.id] || 0);
+    if (d.decision) {
+      return '<button data-revoke-disc="' + d.id + '">撤销' +
+        (d.decision === 'gain' ? '盘盈' : '盘亏') + '</button>';
+    }
+    if (res <= 0) return '<span class="muted">已由错放处理</span>';
+    return (d.kind === 'surplus'
+      ? '<button class="ok" data-decide="gain" data-did="' + d.id +
+        '">认定盘盈</button>'
+      : '<button class="ign" data-decide="loss" data-did="' + d.id +
+        '">认定盘亏</button>');
+  }).join(' ');
+}
+
+function stockPairsHtml(st, pairs, moves) {
+  return pairs.map((p) => {
+    const m = p.move_task_id
+      ? moves.find((x) => x.id === p.move_task_id) : null;
+    const stateTxt = { candidate: '待处理', tasked: '已生成移格 #' + p.move_task_id,
+      moved: '移格已复扫 #' + p.move_task_id, writeoff: '已核销（盘盈/盘亏）',
+      posted: '已入账' }[p.status] || p.status;
+    let acts = '';
+    if (p.status === 'candidate') {
+      acts = '<button class="primary" data-move="' + p.id + '">生成移格任务</button> ' +
+        '<button data-writeoff="' + p.id + '">不移动，核销为盘盈/盘亏</button>';
+    } else if (m && (m.status === 'pending' || m.status === 'src_ok'
+                     || m.status === 'done')) {
+      acts = '<button data-scanmove="' + m.id + '">' +
+        (m.status === 'done' ? '移格已复扫（可取消）' : '双端复扫') + '</button> ' +
+        '<button data-cancelmove="' + m.id + '" class="danger">取消移格</button> ' +
+        '<button data-revokepair="' + p.id + '">撤销候选处理</button>';
+    } else {
+      acts = '<button data-revokepair="' + p.id + '">撤销</button>';
+    }
+    return '<div class="pair-line ' + p.status + '"><div>' +
+      '<b>' + p.code + '</b>：' + esc(p.spec_char) + ' ' +
+      esc(p.spec_font || '—') + ' ' + esc(p.spec_size || '—') + ' ×' + p.qty +
+      '　<span class="diff-ok">溢出格 ' + esc(p.src_label) + '</span> → ' +
+      '<span class="diff-up">短缺格 ' + esc(p.dst_label) + '</span></div>' +
+      '<div class="muted">状态：' + stateTxt + '</div><div class="row">' + acts +
+      '</div>' + (m && moveStageCtx && moveStageCtx.taskId === m.id
+        ? '<div id="moveScanBox" class="move-scan"></div>' : '') + '</div>';
+  }).join('');
+}
+
+function stockPreviewHtml(st, pv) {
+  if (!pv.changes.length && !pv.errors.length) {
+    return '<p class="hint">入账不会改变任何存量。</p>';
+  }
+  let html = '';
+  if (pv.errors.length) {
+    html += '<p class="diff-up">不能入账：</p><ul class="stock-errors">' +
+      pv.errors.map((e) => '<li>' + esc(e) + '</li>').join('') + '</ul>';
+  }
+  if (pv.changes.length) {
+    html += '<table class="tasks"><thead><tr><th>格号</th><th>账面值</th>' +
+      '<th>实物</th><th>移格</th><th>入账后</th><th>规格变更</th></tr></thead><tbody>' +
+      pv.changes.map((c) =>
+      '<tr><td><b>' + esc(c.label) + '</b></td><td>' + c.before_qty + '</td>' +
+      '<td>' + c.actual_qty + '</td><td>' +
+      (c.move_out ? '<span class="diff-up">出 ' + c.move_out + '</span>' : '') +
+      (c.move_in ? '<span class="diff-ok">入 ' + c.move_in + '</span>' : '') +
+      (c.move_out || c.move_in ? '' : '—') + '</td><td><b>' + c.final_qty +
+      '</b></td><td>' + (c.spec_changed
+        ? '<span class="diff-up">' +
+          esc(specText(c.actual_char, c.actual_font, c.actual_size)) + ' → ' +
+          esc(specText(c.final_char, c.final_font, c.final_size)) + '</span>'
+        : '—') + '</td></tr>').join('') + '</tbody></table>';
+  }
+  html += '<p class="hint">短缺 ' + pv.n_short + ' 项 · 溢出 ' + pv.n_surplus +
+    ' 项 · 待复核 ' + pv.n_review + ' 项。入账后每格保留盘点前后值，且不可再撤销。</p>';
+  return html;
+}
+
+/* ---- 已入账 / 已取消 ---- */
+
+function stockFinishedHtml(st) {
+  const posted = st.status === 'posted';
+  let html = '<div class="panel"><h2>盘点单 #' + st.id + ' · ' +
+    stockName(st, 'status') + '</h2>' +
+    '<p class="hint">字盘 <b>' + esc(st.tray_name) + '</b>（' +
+    esc(st.tray_code) + '）· 开始 ' + esc(st.started_at) +
+    (posted ? ' · 入账 ' + esc(st.posted_at) : ' · 取消 ' + esc(st.cancelled_at)) +
+    '</p></div>';
+  if (posted) {
+    html += '<div class="panel"><h3>入账明细（保留盘点前后值）</h3>' +
+      '<table class="tasks"><thead><tr><th>格号</th><th>类型</th><th>数量</th>' +
+      '<th>前</th><th>后</th></tr></thead><tbody>' +
+      st.postings.map((p) => {
+        const cc = st.cells.find((c) => c.cell_id === p.cell_id);
+        const kn = { gain: '盘盈', loss: '盘亏', spec: '规格订正',
+          move_out: '移格出', move_in: '移格入' }[p.kind] || p.kind;
+        return '<tr><td>' + esc(cc ? cc.cell_label : '#' + p.cell_id) +
+          '</td><td>' + kn + (p.move_task_id ? '（移格 #' + p.move_task_id + '）'
+            : '') + '</td><td>' + p.qty + '</td><td>' + p.before_qty +
+          '</td><td><b>' + p.after_qty + '</b></td></tr>';
+      }).join('') + '</tbody></table></div>';
+  }
+  html += '<div class="panel"><h3>盘点记录</h3>' + stockFinishedCells(st) +
+    '<div class="row"><button data-print="' + st.id + '">打印差异单</button></div></div>';
+  return html;
+}
+
+function stockFinishedCells(st) {
+  return '<table class="tasks"><thead><tr><th>格号</th><th>账面</th><th>实物</th>' +
+    '<th>状态</th></tr></thead><tbody>' + st.cells.map((c) =>
+    '<tr><td>' + esc(c.cell_label) + '</td><td>' +
+    esc(specText(c.book_char, c.book_font, c.book_size)) + ' · ' + c.book_qty +
+    '</td><td>' + (c.actual_qty == null
+      ? '—'
+      : esc(specText(c.actual_char, c.actual_font, c.actual_size)) + ' · ' +
+        c.actual_qty) + '</td><td>' + countName(c.status) + '</td></tr>').join('')
+    + '</tbody></table>';
+}
+
+/* ---- 盘点字盘绘制 ---- */
+
+function drawStockTray(st, cur) {
+  const cells = S.cells.filter((c) => c.tray_id === st.tray_id);
+  const scByCell = {};
+  for (const sc of st.cells) scByCell[sc.cell_id] = sc;
+  drawTray($('#stockTray'), cells, {
+    cls: (c) => {
+      const sc = scByCell[c.id];
+      if (cur && c.id === cur.cell_id) return 'stock-cur';
+      if (sc) {
+        if (sc.status === 'counted') return 'stock-done';
+        if (sc.status === 'pending') return '';
+        return 'stock-flag';
+      }
+      return '';
+    },
+    sub: (c) => {
+      const sc = scByCell[c.id];
+      if (!sc || sc.status === 'pending') return null;
+      if (sc.status === 'counted') {
+        const diff = sc.actual_qty - sc.book_qty;
+        return { text: sc.actual_qty, cls: diff ? (diff < 0
+          ? 'cell-sub-down' : 'cell-sub-up') : '' };
+      }
+      return { text: { mixed: '混', unrecognized: '?', blocked: '禁' }[sc.status],
+               cls: 'cell-sub-flag' };
+    },
+    onClick: (c) => {
+      const inp = $('#scLabel');
+      if (inp) { inp.value = c.label; $('#scQty').focus(); }
+    },
+  });
+}
+
+/* ---- 事件绑定 ---- */
+
+function bindStockWork(st) {
+  // 字盘图（盘点中）
+  const svg = $('#stockTray');
+  if (svg && st.status === 'counting') {
+    drawStockTray(st, st.cells.find((c) => c.status === 'pending'));
+  }
+  const startBtn = $('#btnScSubmit');
+  if (startBtn) startBtn.onclick = () => submitStockCount(st);
+  const labelInput = $('#scLabel');
+  if (labelInput) {
+    labelInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); $('#scQty').focus(); }
+    });
+    setTimeout(() => $('#scQty').focus(), 0);
+  }
+  const qty = $('#scQty');
+  if (qty) qty.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') submitStockCount(st);
+  });
+  document.querySelectorAll('#stockWork [data-flag]').forEach((b) => {
+    b.onclick = () => submitStockCount(st, b.dataset.flag);
+  });
+  const undo = $('#btnScUndo');
+  if (undo) undo.onclick = () => guard(async () => {
+    applyState((await api('/api/stocktakes/' + st.id + '/undo-count',
+      'POST')).state);
+    toast('已撤销上一格录入');
+  });
+  document.querySelectorAll('#stockWork #btnScCancel').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      if (!confirm('取消盘点单 #' + st.id + '？已录入数据保留记录，盘锁解除。')) return;
+      applyState((await api('/api/stocktakes/' + st.id + '/cancel',
+        'POST')).state);
+      stockSelId = null;
+      toast('盘点单已取消');
+    });
+  });
+  const post = $('#btnScPost');
+  if (post) post.onclick = () => guard(async () => {
+    if (!confirm('确认一次性入账？入账后保留盘点前后值，决议不可再撤销。')) return;
+    const res = await api('/api/stocktakes/' + st.id + '/post', 'POST');
+    applyState(res.state);
+    stockSelId = null;
+    toast('盘点差异已入账');
+  });
+  const pr = $('#btnScPrint');
+  if (pr) pr.onclick = () => printStockSheet(st);
+  document.querySelectorAll('#stockWork [data-recheck]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      applyState((await api('/api/stocktakes/' + st.id + '/recheck', 'POST',
+        { cell_id: parseInt(b.dataset.recheck, 10) })).state);
+      toast('该格已拉回复盘，请按高亮重新录入');
+    });
+  });
+  document.querySelectorAll('#stockWork [data-decide]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      applyState((await api('/api/discrepancies/' + b.dataset.did + '/decide',
+        'POST', { decision: b.dataset.decide })).state);
+      toast(b.dataset.decide === 'gain' ? '已认定盘盈' : '已认定盘亏');
+    });
+  });
+  document.querySelectorAll('#stockWork [data-revoke-disc]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      applyState((await api('/api/discrepancies/' + b.dataset.revokeDisc +
+        '/revoke', 'POST')).state);
+      toast('决议已撤销');
+    });
+  });
+  document.querySelectorAll('#stockWork [data-move]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      const res = await api('/api/pairs/' + b.dataset.move + '/move', 'POST');
+      applyState(res.state);
+      moveStageCtx = { taskId: res.move_task_id };
+      toast('移格任务已生成，请依次复扫来源格与目标格');
+    });
+  });
+  document.querySelectorAll('#stockWork [data-writeoff]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      applyState((await api('/api/pairs/' + b.dataset.writeoff + '/writeoff',
+        'POST')).state);
+      toast('已核销：来源端记盘盈、目标端记盘亏');
+    });
+  });
+  document.querySelectorAll('#stockWork [data-revokepair]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      applyState((await api('/api/pairs/' + b.dataset.revokepair + '/revoke',
+        'POST')).state);
+      toast('已撤销候选处理');
+    });
+  });
+  document.querySelectorAll('#stockWork [data-cancelmove]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      if (!confirm('取消该移格任务？两端都不会改库存。')) return;
+      applyState((await api('/api/move-tasks/' + b.dataset.cancelmove +
+        '/cancel', 'POST')).state);
+      toast('移格任务已取消');
+    });
+  });
+  document.querySelectorAll('#stockWork [data-scanmove]').forEach((b) => {
+    b.onclick = () => openMoveScan(st, parseInt(b.dataset.scanmove, 10));
+  });
+  renderStockConflict(st);
+  const box = $('#moveScanBox');
+  if (box && moveStageCtx) renderMoveScan(st, box);
+}
+
+function submitStockCount(st, flag) {
+  const body = { label: $('#scLabel').value.trim() };
+  if (flag) {
+    body.flag = flag;
+    const qv = $('#scQty').value.trim();
+    if (qv) body.qty = parseInt(qv, 10);
+  } else {
+    body.qty = parseInt($('#scQty').value, 10);
+    body.actual_char = $('#scChar').value.trim();
+    body.actual_font = $('#scFont').value.trim();
+    body.actual_size = $('#scSize').value.trim();
+  }
+  guard(async () => {
+    const res = await api('/api/stocktakes/' + st.id + '/count', 'POST', body);
+    if (res.ok) {
+      stockConflict = null;
+      applyState(res.state);
+      if (stockById(st.id) && stockById(st.id).status === 'reviewing') {
+        toast('全盘录入完成，请处理差异复核');
+      }
+    } else {
+      stockConflict = res.conflict;
+      applyState(res.state);
+      stockSelId = st.id;
+      renderStockConflict(stockById(st.id));
+    }
+  });
+}
+
+function renderStockConflict(st) {
+  const box = $('#stockConflict');
+  if (!box) return;
+  if (!stockConflict) { box.innerHTML = ''; return; }
+  const c = stockConflict;
+  box.innerHTML = '<div class="panel conflict"><h3>' + esc(c.message) + '</h3>' +
+    (c.expected ? '<div class="compare">' +
+      cellBox('应盘格', c.expected) +
+      (c.scanned ? '<div class="arrow">≠</div>' + cellBox('实际扫描', c.scanned)
+        : '') + '</div>' : '') +
+    '<div class="row"><button id="btnStockConflictOk">知道了，重新扫描</button></div>' +
+    '</div>';
+  $('#btnStockConflictOk').onclick = () => {
+    stockConflict = null; renderStockConflict(st);
+  };
+}
+
+function openMoveScan(st, taskId) {
+  const pairBtn = document.querySelector('[data-scanmove="' + taskId + '"]');
+  const host = pairBtn ? pairBtn.closest('.pair-line') : null;
+  if (!host) return;  // 已入账视图无候选行
+  let mb = host.querySelector('#moveScanBox');
+  if (!mb) {
+    mb = document.createElement('div');
+    mb.id = 'moveScanBox';
+    mb.className = 'move-scan';
+    host.appendChild(mb);
+  }
+  moveStageCtx = { taskId };
+  renderMoveScan(st, mb);
+}
+
+function renderMoveScan(st, box) {
+  const mid = moveStageCtx.taskId;
+  const m = st.move_tasks.find((x) => x.id === mid);
+  if (!m) { box.remove(); moveStageCtx = null; return; }
+  const stage = m.status === 'pending' ? 'source' : 'target';
+  const expectLabel = stage === 'source' ? m.source_label : m.target_label;
+  const done = m.status === 'done';
+  box.innerHTML = (done
+    ? '<p class="diff-ok">两端已复扫完成：' + esc(m.source_label) + ' → ' +
+      esc(m.target_label) + '（入账时才改库存）</p>'
+    : '<p>' + (stage === 'source'
+        ? '第 1 步：复扫<b class="diff-ok">来源格</b>（取出 ' +
+          esc(m.spec_char) + ' ×' + m.qty + '）'
+        : '来源格 ✓ ' + esc(m.source_label) +
+          '；第 2 步：复扫<b class="diff-up">目标格</b>') +
+      '，当前应扫 <b>' + esc(expectLabel) + '</b></p>' +
+      '<div class="scan-row"><input class="mono" id="moveScanInput" ' +
+      'placeholder="扫描格号后回车"><button class="primary" id="moveScanBtn">' +
+      '确认本端</button></div><div id="moveScanMsg"></div>');
+  const inp = box.querySelector('#moveScanInput');
+  if (!done) setTimeout(() => inp && inp.focus(), 0);
+  const btn = box.querySelector('#moveScanBtn');
+  const doScan = () => guard(async () => {
+    const res = await api('/api/move-tasks/' + mid + '/scan', 'POST',
+      { label: inp.value.trim() });
+    if (res.ok) {
+      applyState(res.state);
+      stockSelId = st.id;
+      toast(res.stage_done === 'source' ? '来源格已确认，请复扫目标格'
+        : '目标格已确认，移格待入账');
+    } else {
+      const msg = box.querySelector('#moveScanMsg');
+      if (msg) msg.innerHTML = '<span class="diff-up">' +
+        esc(res.conflict.message) + '</span>';
+    }
+  });
+  if (btn) {
+    btn.onclick = doScan;
+    inp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') doScan(); });
+  }
+}
+
+/* ---- 打印差异单 ---- */
+
+function printStockSheet(st) {
+  if (!st) { toast('没有可打印的盘点单', true); return; }
+  const { byCell, covered } = st.status === 'reviewing'
+    ? stockDiscMap(st) : { byCell: {}, covered: {} };
+  const rows = st.cells.map((c) => {
+    const ds = (byCell[c.cell_id] || []);
+    if (!ds.length) return null;
+    const diffs = ds.map((d) => d.kind === 'review'
+      ? '待复核：' + reviewName(d.review_kind)
+      : discName(d.kind) + ' ' + specText(d.spec_char, d.spec_font, d.spec_size) +
+        ' ' + d.qty + ' 枚' + (d.decision ? '（' +
+          (d.decision === 'gain' ? '盘盈' : '盘亏') + '）' : '')).join('；');
+    return '<tr><td>' + esc(c.cell_label) + '</td><td>' +
+      esc(specText(c.book_char, c.book_font, c.book_size)) + ' · ' + c.book_qty +
+      '</td><td>' + (c.actual_qty == null
+        ? countName(c.status)
+        : esc(specText(c.actual_char, c.actual_font, c.actual_size)) + ' · ' +
+          c.actual_qty) + '</td><td>' + esc(diffs) + '</td></tr>';
+  }).filter(Boolean).join('');
+  const pairHtml = st.pairs.length
+    ? '<h3>错放候选 / 移格任务</h3><table><thead><tr><th>编号</th><th>规格</th>' +
+      '<th>来源格</th><th>目标格</th><th>数量</th><th>状态</th></tr></thead><tbody>' +
+      st.pairs.map((p) => {
+        const m = p.move_task_id
+          ? st.move_tasks.find((x) => x.id === p.move_task_id) : null;
+        const txt = { candidate: '候选', tasked: '待复扫', moved: '已复扫',
+          writeoff: '核销', posted: '已入账' }[p.status] || p.status;
+        return '<tr><td>' + p.code + '</td><td>' +
+          esc(specText(p.spec_char, p.spec_font, p.spec_size)) + '</td><td>' +
+          esc(p.src_label) + '</td><td>' + esc(p.dst_label) + '</td><td>' + p.qty +
+          '</td><td>' + txt + (m ? '（移格 #' + m.id + '）' : '') + '</td></tr>';
+      }).join('') + '</tbody></table>' : '';
+  $('#printArea').innerHTML =
+    '<div class="stock-sheet"><h2>盘点差异单</h2>' +
+    '<p>盘点单 #' + st.id + '　字盘：' + esc(st.tray_name) + '（' +
+    esc(st.tray_code) + '）　开始：' + esc(st.started_at) +
+    '　状态：' + stockName(st, 'status') + '</p>' +
+    '<table><thead><tr><th>格号</th><th>账面</th><th>实物</th><th>差异 / 决议</th>' +
+    '</tr></thead><tbody>' + rows + '</tbody></table>' + pairHtml +
+    '<p class="sign">盘点人：____________　复核人：____________　日期：____________</p>' +
+    '</div>';
+  window.print();
+}
+
+function bindStockStart() {
+  const inp = $('#stockStartInput');
+  const go = () => guard(async () => {
+    const code = inp.value.trim();
+    if (!code) return;
+    const res = await api('/api/stocktakes', 'POST', { scan_code: code });
+    applyState(res.state);
+    stockSelId = res.stocktake_id;
+    inp.value = '';
+    toast('盘点单 #' + res.stocktake_id + ' 已开始，按高亮顺序扫描格号');
+  });
+  $('#btnStockStart').onclick = go;
+  inp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') go(); });
+}
+
 /* ---------------- 总渲染 ---------------- */
 
 function renderAll() {
@@ -1118,6 +1812,7 @@ function renderAll() {
   renderTrayEditor();
   renderPending();
   renderData();
+  renderStock();
 }
 
 function main() {
@@ -1128,6 +1823,7 @@ function main() {
   bindTrayBar();
   bindCellForm();
   bindData();
+  bindStockStart();
   switchView('run');
   refresh();
 }

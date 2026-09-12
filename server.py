@@ -96,6 +96,85 @@ CREATE TABLE IF NOT EXISTS actions (
   payload TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS stocktakes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tray_id INTEGER NOT NULL REFERENCES trays(id),
+  status TEXT NOT NULL DEFAULT 'counting', -- counting / reviewing / posted / cancelled
+  created_at TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,                       -- 全盘格位录完、进入差异复核
+  posted_at TEXT,                         -- 一次性入账时间
+  cancelled_at TEXT,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS stocktake_cells (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stocktake_id INTEGER NOT NULL REFERENCES stocktakes(id),
+  cell_id INTEGER NOT NULL REFERENCES cells(id),
+  seq INTEGER NOT NULL,                   -- 盘内蛇形高亮次序
+  book_label TEXT NOT NULL DEFAULT '',
+  book_char TEXT NOT NULL DEFAULT '', book_font TEXT NOT NULL DEFAULT '',
+  book_size TEXT NOT NULL DEFAULT '', book_qty INTEGER NOT NULL DEFAULT 0,
+  actual_qty INTEGER,                     -- 实物点数；暂时不能盘时为 NULL
+  actual_char TEXT, actual_font TEXT, actual_size TEXT,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending / counted / mixed / unrecognized / blocked
+  counted_at TEXT,
+  UNIQUE(stocktake_id, cell_id)
+);
+CREATE TABLE IF NOT EXISTS discrepancies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stocktake_id INTEGER NOT NULL REFERENCES stocktakes(id),
+  cell_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                     -- short / surplus / review
+  review_kind TEXT NOT NULL DEFAULT '',   -- kind=review：mixed / unrecognized / blocked
+  spec_char TEXT NOT NULL DEFAULT '',
+  spec_font TEXT NOT NULL DEFAULT '',
+  spec_size TEXT NOT NULL DEFAULT '',
+  qty INTEGER NOT NULL DEFAULT 0,         -- 差额绝对值
+  decision TEXT NOT NULL DEFAULT '',      -- '' / gain(盘盈) / loss(盘亏)
+  move_task_id INTEGER,
+  posted INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS discrepancy_pairs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stocktake_id INTEGER NOT NULL,
+  code TEXT NOT NULL,                     -- P1、P2…
+  spec_char TEXT NOT NULL DEFAULT '',
+  spec_font TEXT NOT NULL DEFAULT '',
+  spec_size TEXT NOT NULL DEFAULT '',
+  src_disc_id INTEGER NOT NULL,           -- 溢出端：实物多出的格（移格来源）
+  dst_disc_id INTEGER NOT NULL,           -- 短缺端：账面应有却少的格（移格目标）
+  qty INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'candidate', -- candidate / moved / writeoff / posted
+  move_task_id INTEGER,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS move_tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stocktake_id INTEGER NOT NULL REFERENCES stocktakes(id),
+  source_cell_id INTEGER NOT NULL,
+  target_cell_id INTEGER NOT NULL,
+  spec_char TEXT NOT NULL DEFAULT '', spec_font TEXT NOT NULL DEFAULT '',
+  spec_size TEXT NOT NULL DEFAULT '',
+  qty INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending / src_ok / done / cancelled / posted
+  src_scan TEXT NOT NULL DEFAULT '',
+  tgt_scan TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  done_at TEXT
+);
+CREATE TABLE IF NOT EXISTS postings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stocktake_id INTEGER NOT NULL,
+  cell_id INTEGER NOT NULL,
+  move_task_id INTEGER,
+  kind TEXT NOT NULL,                     -- gain / loss / spec / move_out / move_in
+  qty INTEGER NOT NULL DEFAULT 0,
+  before_qty INTEGER NOT NULL,
+  after_qty INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
 """
 
 # ---------------------------------------------------------------- 字表
@@ -119,6 +198,19 @@ UNKNOWN_TOKENS = {"?", "？", "□", "▯", "■", "�", "×", "无法辨认"}
 
 REASON_NAMES = {"ligature": "合字", "variant": "异体字",
                 "unknown": "无法辨认", "unmatched": "无匹配格位"}
+
+# 盘点相关名称
+STOCK_STATUS_NAMES = {"counting": "盘点中", "reviewing": "差异复核",
+                      "posted": "已入账", "cancelled": "已取消"}
+COUNT_STATUS_NAMES = {"pending": "待盘", "counted": "已盘",
+                      "mixed": "混字", "unrecognized": "无法辨认",
+                      "blocked": "暂不能盘"}
+REVIEW_NAMES = {"mixed": "混字", "unrecognized": "无法辨认",
+                "blocked": "暂时不能盘点"}
+DISC_KIND_NAMES = {"short": "短缺", "surplus": "溢出", "review": "待复核"}
+
+# 盘点进行中（锁住归还确认与存量编辑）的状态
+ST_ACTIVE = ("counting", "reviewing")
 
 
 class ApiError(Exception):
@@ -305,10 +397,22 @@ def get_state():
         last_done = _load_session(ds) if ds else None
         pending = rows("SELECT * FROM pending_items WHERE status='open' "
                        "ORDER BY id")
+        # 盘点：进行中的（最多每盘一个）全量载入；另附最近历史概要与名称表
+        stock_rows = rows("SELECT * FROM stocktakes WHERE status IN ('counting',"
+                          "'reviewing') ORDER BY id")
+        stocktakes = [_load_stocktake(s) for s in stock_rows]
+        history = [_stock_brief(s) for s in rows(
+            "SELECT * FROM stocktakes WHERE status IN ('posted','cancelled') "
+            "ORDER BY id DESC LIMIT 10")]
         return {"trays": trays, "cells": cells, "session": session,
                 "last_done": last_done, "pending": pending,
                 "conflicts": capacity_conflicts(cells, session),
-                "reason_names": REASON_NAMES}
+                "reason_names": REASON_NAMES,
+                "stocktakes": stocktakes, "stocktake_history": history,
+                "stock_status_names": STOCK_STATUS_NAMES,
+                "count_status_names": COUNT_STATUS_NAMES,
+                "review_names": REVIEW_NAMES,
+                "disc_kind_names": DISC_KIND_NAMES}
 
 
 def conflict(ctype, message, **kw):
@@ -359,6 +463,23 @@ def _advance(session_id):
 def _current_task(session_id):
     return row("SELECT * FROM tasks WHERE session_id=? AND status='active' "
                "ORDER BY seq LIMIT 1", (session_id,))
+
+# ---------------------------------------------------------------- 盘点锁
+
+
+def _active_stocktake(tray_id):
+    """该字盘是否有进行中的盘点（盘点中 / 差异复核）。有则返回盘点行。"""
+    return row("SELECT * FROM stocktakes WHERE tray_id=? AND status IN ('counting',"
+               "'reviewing') ORDER BY id DESC LIMIT 1", (tray_id,))
+
+
+def _assert_no_stocktake(tray_id, verb):
+    """盘点期间锁住该盘的归还确认与存量编辑。"""
+    st = _active_stocktake(tray_id)
+    if st:
+        raise ApiError("字盘正在盘点（盘点单 #%d，%s），盘点结束前不能%s"
+                       % (st["id"], STOCK_STATUS_NAMES[st["status"]], verb))
+
 
 # ---------------------------------------------------------------- 字盘 API
 
@@ -558,6 +679,7 @@ def _cell_tray(body, default=None):
 def create_cell(body):
     tray_id = _cell_tray(body)
     get_tray(tray_id)
+    _assert_no_stocktake(tray_id, "在该盘新建格位")
     label = str(body.get("label") or "").strip()
     if not label:
         raise ApiError("格号不能为空")
@@ -580,6 +702,7 @@ def update_cell(cell_id, body):
     cell = row("SELECT * FROM cells WHERE id=?", (cell_id,))
     if not cell:
         raise ApiError("格位不存在", 404)
+    _assert_no_stocktake(cell["tray_id"], "编辑该盘格位")
     if "tray_id" in body and int(body["tray_id"]) != cell["tray_id"]:
         raise ApiError("不能把格位移到另一个字盘，请在目标盘新建")
     sets, args = [], []
@@ -612,6 +735,8 @@ def update_cell(cell_id, body):
 def delete_cell(cell_id):
     if not row("SELECT id FROM cells WHERE id=?", (cell_id,)):
         raise ApiError("格位不存在", 404)
+    tray_id = row("SELECT tray_id FROM cells WHERE id=?", (cell_id,))["tray_id"]
+    _assert_no_stocktake(tray_id, "删除该盘格位")
     used = row("SELECT COUNT(*) AS n FROM tasks WHERE cell_id=?", (cell_id,))
     if used["n"]:
         raise ApiError("该格已有归还任务记录，不能删除")
@@ -633,6 +758,8 @@ def bulk_cells(body):
         if not row("SELECT id FROM trays WHERE id=?", (tray_id,)):
             skipped.append(str(c.get("label") or ""))
             continue
+        if _active_stocktake(tray_id):
+            raise ApiError("目标字盘正在盘点，盘点结束前不能新建格位")
         label = str(c.get("label") or "").strip()
         if not label:
             continue
@@ -878,6 +1005,7 @@ def confirm_task(task_id, body):
     sess = row("SELECT * FROM sessions WHERE id=?", (t["session_id"],))
     if not sess or sess["status"] != "active":
         raise ApiError("批次未在执行中，不能确认")
+    _assert_no_stocktake(t["tray_id"], "确认归还（该盘正在盘点）")
     if t["status"] == "done":
         return conflict("duplicate", "该任务已完成，请勿重复确认", task=t)
     if t["status"] != "active":
@@ -955,6 +1083,7 @@ def reassign_task(task_id, body):
     new = row("SELECT * FROM cells WHERE id=?", (new_id,))
     if not new:
         raise ApiError("目标格位不存在")
+    _assert_no_stocktake(new["tray_id"], "改派（该盘正在盘点）")
     if old and new["id"] == old["id"]:
         raise ApiError("目标与原格位相同")
     # 换盘导航下不允许跨字盘改派：跨盘必须走换盘闸门
@@ -1119,16 +1248,697 @@ def resolve_pending(pid, body):
             pass
     return {"ok": True, "state": get_state()}
 
+# ---------------------------------------------------------------- 盘点 API
+
+
+def _stock_brief(st):
+    """盘点单概要：进度与所属字盘信息。"""
+    d = dict(st)
+    tr = row("SELECT name, scan_code FROM trays WHERE id=?", (st["tray_id"],))
+    d["tray_name"] = tr["name"] if tr else "（已删除字盘）"
+    d["tray_code"] = tr["scan_code"] if tr else ""
+    n = row("SELECT COUNT(*) AS total,"
+             "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
+             "SUM(CASE WHEN status NOT IN ('pending','counted') THEN 1 ELSE 0 END)"
+             " AS flagged FROM stocktake_cells WHERE stocktake_id=?",
+             (st["id"],))
+    d["total"] = n["total"] or 0
+    d["n_pending"] = n["pending"] or 0
+    d["n_flagged"] = n["flagged"] or 0
+    d["n_counted"] = d["total"] - d["n_pending"]
+    return d
+
+
+def _find_tray_by_code(code):
+    code = (code or "").strip()
+    if not code:
+        return None
+    return row("SELECT * FROM trays WHERE upper(scan_code)=? AND scan_code<>''",
+               (code.upper(),))
+
+
+@transactional
+def start_stocktake(body):
+    """扫描字盘码开始盘点：锁定该盘，按蛇形次序生成全部格位快照。"""
+    code = str(body.get("scan_code") or "").strip()
+    tr = _find_tray_by_code(code)
+    if not tr:
+        raise ApiError("无法识别的字盘码「%s」，请扫描实体字盘上的字盘码" % code)
+    if _active_stocktake(tr["id"]):
+        raise ApiError("字盘「%s」已有进行中的盘点单，请先完成或取消" % tr["name"])
+    cells = rows("SELECT * FROM cells WHERE tray_id=? ORDER BY y, x", (tr["id"],))
+    if not cells:
+        raise ApiError("字盘「%s」还没有格位，无法盘点" % tr["name"])
+    ts = now()
+    cur = db.execute(
+        "INSERT INTO stocktakes(tray_id,status,created_at,started_at,note) "
+        "VALUES(?, 'counting', ?, ?, ?)",
+        (tr["id"], ts, ts, "盘点单 " + ts))
+    sid = cur.lastrowid
+    ordered = plan_order([{"x": c["x"], "y": c["y"], "id": c["id"]} for c in cells])
+    by_id = {c["id"]: c for c in cells}
+    for i, it in enumerate(ordered):
+        c = by_id[it["id"]]
+        db.execute(
+            "INSERT INTO stocktake_cells(stocktake_id,cell_id,seq,book_label,"
+            "book_char,book_font,book_size,book_qty) VALUES(?,?,?,?,?,?,?,?)",
+            (sid, c["id"], i + 1, c["label"], c["char"], c["font"], c["size"],
+             c["qty"]))
+    return {"ok": True, "stocktake_id": sid, "state": get_state()}
+
+
+@transactional
+def cancel_stocktake(sid):
+    st = _get_stocktake_row(sid)
+    if st["status"] not in ST_ACTIVE:
+        raise ApiError("该盘点单已结束，不能取消")
+    db.execute("UPDATE stocktakes SET status='cancelled', cancelled_at=? WHERE id=?",
+               (now(), sid))
+    # 未执行 / 执行一半的移格任务随单一并取消，决议保留在记录里但不再生效
+    db.execute("UPDATE move_tasks SET status='cancelled' WHERE stocktake_id=? "
+               "AND status IN ('pending','src_ok')", (sid,))
+    return {"ok": True, "state": get_state()}
+
+
+def _get_stocktake_row(sid):
+    st = row("SELECT * FROM stocktakes WHERE id=?", (sid,))
+    if not st:
+        raise ApiError("盘点单不存在", 404)
+    return st
+
+
+def _current_count_cell(sid):
+    return row("SELECT * FROM stocktake_cells WHERE stocktake_id=? "
+               "AND status='pending' ORDER BY seq LIMIT 1", (sid,))
+
+
+def stock_conflict(ctype, message, **kw):
+    return {"ok": False, "conflict": dict({"type": ctype, "message": message},
+                                          **kw), "state": get_state()}
+
+
+@transactional
+def count_stocktake_cell(sid, body):
+    """扫描当前高亮格号并录入实数 / 待复核标记，录完自动进入差异复核。"""
+    st = _get_stocktake_row(sid)
+    if st["status"] != "counting":
+        raise ApiError("该盘点单不在盘点中（当前：%s）"
+                       % STOCK_STATUS_NAMES.get(st["status"], st["status"]))
+    cur = _current_count_cell(sid)
+    if not cur:
+        raise ApiError("没有待盘格位")
+    label = str(body.get("label") or "").strip()
+    if not label:
+        raise ApiError("请扫描当前高亮格位的格号")
+    matched = row("SELECT c.* FROM stocktake_cells sc JOIN cells c "
+                  "ON c.id=sc.cell_id "
+                  "WHERE sc.id=? AND upper(c.label)=?", (cur["id"], label.upper()))
+    if not matched:
+        # 格号不属于本字盘，还是本盘别的格？
+        other = row("SELECT c.*, tr.name AS tray_name FROM cells c "
+                    "JOIN trays tr ON tr.id=c.tray_id "
+                    "WHERE upper(c.label)=?", (label.upper(),))
+        if other:
+            cur_cell = row("SELECT c.* FROM cells c WHERE id=?", (cur["cell_id"],))
+            if other["tray_id"] == st["tray_id"]:
+                return stock_conflict(
+                    "count_mismatch",
+                    "盘内扫错格：当前应盘「%s」，扫到「%s」，请按高亮顺序重新扫描"
+                    % (cur_cell["label"], other["label"]),
+                    expected=cur_cell, scanned=other)
+            return stock_conflict(
+                "count_wrong_tray",
+                "扫到的格号「%s」属于字盘「%s」，请在当前盘点字盘上操作"
+                % (other["label"], other["tray_name"]),
+                expected=cur_cell, scanned=other)
+        return stock_conflict("count_unknown",
+                              "无法识别的格号「%s」" % label, label=label,
+                              expected=row("SELECT * FROM cells WHERE id=?",
+                                           (cur["cell_id"],)))
+    flag = str(body.get("flag") or "").strip()
+    if flag:
+        if flag not in ("mixed", "unrecognized", "blocked"):
+            raise ApiError("待复核标记不正确")
+        aq = None
+        if flag != "blocked":
+            q = body.get("qty")
+            if q not in (None, ""):
+                try:
+                    aq = max(0, int(q))
+                except (TypeError, ValueError):
+                    raise ApiError("数量不正确")
+        db.execute("UPDATE stocktake_cells SET status=?, actual_qty=?, "
+                   "actual_char=NULL, actual_font=NULL, actual_size=NULL, "
+                   "counted_at=? WHERE id=?",
+                   (flag, aq, now(), cur["id"]))
+    else:
+        try:
+            aq = int(body.get("qty"))
+        except (TypeError, ValueError):
+            raise ApiError("请填写实物点数（非负整数）")
+        if aq < 0:
+            raise ApiError("实物点数不能为负")
+        # 实物规格：留空取账面；任一填写则按填写值，未填项回退账面
+        achar = body.get("actual_char")
+        if achar is None or str(achar).strip() == "":
+            achar, afont, asize = cur["book_char"], cur["book_font"], cur["book_size"]
+        else:
+            afont = str(body.get("actual_font") or "").strip() or cur["book_font"]
+            asize = str(body.get("actual_size") or "").strip() or cur["book_size"]
+            achar = str(achar).strip()
+        db.execute("UPDATE stocktake_cells SET status='counted', actual_qty=?, "
+                   "actual_char=?, actual_font=?, actual_size=?, counted_at=? "
+                   "WHERE id=?",
+                   (aq, achar, afont, asize, now(), cur["id"]))
+    if not _current_count_cell(sid):
+        db.execute("UPDATE stocktakes SET status='reviewing', finished_at=? WHERE id=?",
+                   (now(), sid))
+        _build_discrepancies(sid)
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def undo_count(sid):
+    """撤销最近录入的一格（刷新续盘时同样从下一待盘格继续）。
+
+    全盘录完进入差异复核后，撤销会同时清空已生成的差异、把盘点单退回盘点中。
+    """
+    st = _get_stocktake_row(sid)
+    if st["status"] not in ("counting", "reviewing"):
+        raise ApiError("盘点单已结束，不能撤销")
+    # 复核阶段已有盘盈 / 盘亏决议或移格任务时，先撤销 / 取消，避免差异悬挂
+    if st["status"] == "reviewing":
+        decided = row("SELECT COUNT(*) AS n FROM discrepancies "
+                      "WHERE stocktake_id=? AND decision!=''", (sid,))["n"]
+        tasked = row("SELECT COUNT(*) AS n FROM move_tasks WHERE stocktake_id=? "
+                     "AND status IN ('pending','src_ok','done')", (sid,))["n"]
+        if decided or tasked:
+            raise ApiError("已有盘盈 / 盘亏决议或移格任务，请先撤销后再修改盘点")
+        db.execute("DELETE FROM discrepancy_pairs WHERE stocktake_id=?", (sid,))
+        db.execute("DELETE FROM discrepancies WHERE stocktake_id=?", (sid,))
+    last = row("SELECT * FROM stocktake_cells WHERE stocktake_id=? "
+               "AND status!='pending' ORDER BY id DESC LIMIT 1", (sid,))
+    if not last:
+        raise ApiError("还没有已录入的格位")
+    db.execute("UPDATE stocktake_cells SET status='pending', actual_qty=NULL, "
+               "actual_char=NULL, actual_font=NULL, actual_size=NULL, "
+               "counted_at=NULL WHERE id=?", (last["id"],))
+    db.execute("UPDATE stocktakes SET status='counting', finished_at=NULL "
+               "WHERE id=?", (sid,))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def recheck_cell(sid, body):
+    """差异复核阶段把待复核格（混字 / 无法辨认 / 暂不能盘）拉回复盘。"""
+    st = _get_stocktake_row(sid)
+    if st["status"] != "reviewing":
+        raise ApiError("只有差异复核阶段可以复盘格位")
+    sc = row("SELECT * FROM stocktake_cells WHERE stocktake_id=? AND cell_id=?",
+             (sid, body.get("cell_id")))
+    if not sc:
+        raise ApiError("该格不属于本盘点单")
+    if sc["status"] not in ("mixed", "unrecognized", "blocked"):
+        raise ApiError("只有待复核格位需要复盘")
+    # 已有盘盈盘亏决议或已生成移格任务时，先撤销 / 取消，避免差异悬挂
+    decided = row("SELECT COUNT(*) AS n FROM discrepancies WHERE stocktake_id=? "
+                  "AND decision!=''", (sid,))["n"]
+    tasked = row("SELECT COUNT(*) AS n FROM move_tasks WHERE stocktake_id=? "
+                 "AND status IN ('pending','src_ok','done')", (sid,))["n"]
+    if decided or tasked:
+        raise ApiError("已有盘盈 / 盘亏决议或移格任务，请先撤销后再复盘该格")
+    db.execute("UPDATE stocktake_cells SET status='pending', actual_qty=NULL, "
+               "actual_char=NULL, actual_font=NULL, actual_size=NULL, "
+               "counted_at=NULL WHERE id=?", (sc["id"],))
+    db.execute("DELETE FROM discrepancy_pairs WHERE stocktake_id=?", (sid,))
+    db.execute("DELETE FROM discrepancies WHERE stocktake_id=?", (sid,))
+    db.execute("UPDATE stocktakes SET status='counting', finished_at=NULL "
+               "WHERE id=?", (sid,))
+    return {"ok": True, "state": get_state()}
+
+
+# ---------------------------------------------------------------- 差异构建
+
+
+def _build_discrepancies(sid):
+    """全盘录完后按格生成短缺 / 溢出 / 待复核；同规格跨格相反差额配成错放候选。
+
+    规格不符的格：账面规格按账面数量短缺、实物规格按实物数量溢出，
+    之后由配对阶段在不同格位间寻找相反差额。
+    """
+    db.execute("DELETE FROM discrepancy_pairs WHERE stocktake_id=?", (sid,))
+    db.execute("DELETE FROM discrepancies WHERE stocktake_id=?", (sid,))
+    scs = rows("SELECT * FROM stocktake_cells WHERE stocktake_id=? ORDER BY seq",
+               (sid,))
+    facts = []  # 可配对的差额
+    for sc in scs:
+        if sc["status"] in ("mixed", "unrecognized", "blocked"):
+            db.execute(
+                "INSERT INTO discrepancies(stocktake_id,cell_id,kind,review_kind,"
+                "spec_char,spec_font,spec_size,qty,created_at) "
+                "VALUES(?,?, 'review', ?, '', '', '', 0, ?)",
+                (sid, sc["cell_id"], sc["status"], now()))
+        if sc["status"] != "counted" or sc["actual_qty"] is None:
+            continue
+        aq, bq = sc["actual_qty"], sc["book_qty"]
+        same = (sc["actual_char"] == sc["book_char"]
+                and sc["actual_font"] == sc["book_font"]
+                and sc["actual_size"] == sc["book_size"])
+        if same:
+            if aq < bq:
+                facts.append((sc, "short", sc["book_char"], sc["book_font"],
+                              sc["book_size"], bq - aq))
+            elif aq > bq:
+                facts.append((sc, "surplus", sc["book_char"], sc["book_font"],
+                              sc["book_size"], aq - bq))
+        else:
+            if bq:
+                facts.append((sc, "short", sc["book_char"], sc["book_font"],
+                              sc["book_size"], bq))
+            if aq:
+                facts.append((sc, "surplus", sc["actual_char"], sc["actual_font"],
+                              sc["actual_size"], aq))
+    discs = {}  # (cell_id, side, spec) -> disc row dict
+    for sc, kind, ch, font, size, qty in facts:
+        cur = db.execute(
+            "INSERT INTO discrepancies(stocktake_id,cell_id,kind,spec_char,"
+            "spec_font,spec_size,qty,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (sid, sc["cell_id"], kind, ch, font, size, qty, now()))
+        discs[(sc["cell_id"], kind, ch, font, size)] = {
+            "id": cur.lastrowid, "cell_id": sc["cell_id"], "kind": kind,
+            "spec": (ch, font, size), "qty": qty, "left": qty}
+    # 同规格、不同格位的溢出与短缺贪心配对（支持部分配对），只出错放候选
+    buckets = {}
+    for d in discs.values():
+        buckets.setdefault(d["spec"], {"surplus": [], "short": []})
+        buckets[d["spec"]][d["kind"]].append(d)
+    n = 0
+    for spec in sorted(buckets, key=lambda k: (k[0], k[1], k[2])):
+        for s in buckets[spec]["surplus"]:
+            for h in buckets[spec]["short"]:
+                if s["left"] <= 0:
+                    break
+                if h["cell_id"] == s["cell_id"] or h["left"] <= 0:
+                    continue
+                q = min(s["left"], h["left"])
+                n += 1
+                db.execute(
+                    "INSERT INTO discrepancy_pairs(stocktake_id,code,spec_char,"
+                    "spec_font,spec_size,src_disc_id,dst_disc_id,qty,status,"
+                    "created_at) VALUES(?,?,?,?,?,?,?,?, 'candidate', ?)",
+                    (sid, "P%d" % n, spec[0], spec[1], spec[2], s["id"], h["id"],
+                     q, now()))
+                s["left"] -= q
+                h["left"] -= q
+
+
+# ---------------------------------------------------------------- 盘点状态组装
+
+
+def _load_stocktake(st):
+    d = _stock_brief(st)
+    sid = st["id"]
+    d["cells"] = rows(
+        "SELECT sc.*, c.label AS cell_label FROM stocktake_cells sc "
+        "JOIN cells c ON c.id=sc.cell_id WHERE sc.stocktake_id=? ORDER BY sc.seq",
+        (sid,))
+    d["discrepancies"] = rows(
+        "SELECT * FROM discrepancies WHERE stocktake_id=? ORDER BY id", (sid,))
+    pairs = rows(
+        "SELECT p.*, sl.label AS src_label, dl.label AS dst_label "
+        "FROM discrepancy_pairs p "
+        "JOIN discrepancies sd ON sd.id=p.src_disc_id "
+        "JOIN discrepancies dd ON dd.id=p.dst_disc_id "
+        "JOIN cells sl ON sl.id=sd.cell_id "
+        "JOIN cells dl ON dl.id=dd.cell_id "
+        "WHERE p.stocktake_id=? ORDER BY p.id", (sid,))
+    d["pairs"] = pairs
+    d["move_tasks"] = rows(
+        "SELECT m.*, sl.label AS source_label, dl.label AS target_label "
+        "FROM move_tasks m "
+        "JOIN cells sl ON sl.id=m.source_cell_id "
+        "JOIN cells dl ON dl.id=m.target_cell_id "
+        "WHERE m.stocktake_id=? ORDER BY m.id", (sid,))
+    d["postings"] = rows(
+        "SELECT * FROM postings WHERE stocktake_id=? ORDER BY id", (sid,))
+    if st["status"] == "reviewing":
+        d["preview"] = _stock_preview(d)
+    else:
+        d["preview"] = None
+    return d
+
+
+def _stock_preview(stk):
+    """差异复核预览：配对覆盖、剩余决议、移格影响、入账前后值与可入账性。"""
+    sid = stk["id"]
+    cells = {sc["cell_id"]: sc for sc in stk["cells"]}
+    discs = {d["id"]: d for d in stk["discrepancies"]}
+    covered = {d["id"]: 0 for d in stk["discrepancies"]}
+    errors, warnings = [], []
+    done_move_ids = set()
+    for m in stk["move_tasks"]:
+        if m["status"] in ("pending", "src_ok"):
+            errors.append("移格任务 #%d（%s → %s）尚未双端复扫完成"
+                          % (m["id"], m["source_label"], m["target_label"]))
+        elif m["status"] == "done":
+            done_move_ids.add(m["id"])
+    for p in stk["pairs"]:
+        if p["status"] in ("moved", "writeoff", "posted"):
+            covered[p["src_disc_id"]] += p["qty"]
+            covered[p["dst_disc_id"]] += p["qty"]
+        if p["status"] == "candidate":
+            errors.append("错放候选 %s（%s「%s」%s → %s）尚未生成移格任务或核销"
+                          % (p["code"], p["src_label"], p["spec_char"],
+                             p["spec_size"] or "", p["dst_label"]))
+    for d in stk["discrepancies"]:
+        if d["kind"] == "review":
+            rname = REVIEW_NAMES.get(d["review_kind"], d["review_kind"])
+            sc = cells.get(d["cell_id"])
+            errors.append("格 %s 待复核（%s），请复盘该格后再入账"
+                          % (sc["cell_label"] if sc else "?", rname))
+            continue
+        residual = d["qty"] - covered[d["id"]]
+        if residual > 0 and not d["decision"]:
+            sc = cells.get(d["cell_id"])
+            errors.append("格 %s 的%s %d 枚尚未认定盘盈 / 盘亏"
+                          % (sc["cell_label"] if sc else "?",
+                             DISC_KIND_NAMES[d["kind"]], residual))
+    # 模拟入账：先对齐账面→实数，再执行已完成移格
+    move_out, move_in = {cid: 0 for cid in cells}, {cid: 0 for cid in cells}
+    for m in stk["move_tasks"]:
+        if m["id"] not in done_move_ids:
+            continue
+        move_out[m["source_cell_id"]] += m["qty"]
+        move_in[m["target_cell_id"]] += m["qty"]
+    cur_cells = {c["id"]: c for c in
+                 rows("SELECT * FROM cells WHERE tray_id=?", (stk["tray_id"],))}
+    changes = []
+    for cid, sc in cells.items():
+        if sc["status"] != "counted" or sc["actual_qty"] is None:
+            continue
+        fq = sc["actual_qty"] + move_in.get(cid, 0) - move_out.get(cid, 0)
+        if fq < 0:
+            errors.append("格 %s 执行移格后存量为 %d，不能入账，请核对移格数量"
+                          % (sc["cell_label"], fq))
+        same = (sc["actual_char"] == sc["book_char"]
+                and sc["actual_font"] == sc["book_font"]
+                and sc["actual_size"] == sc["book_size"])
+        fch, ffont, fsize = sc["book_char"], sc["book_font"], sc["book_size"]
+        if not same:
+            # 实物整格移出、账面规格整格移回：账面规格恢复；否则按实物规格改正
+            if move_out.get(cid, 0) >= sc["actual_qty"] and move_in.get(cid, 0) > 0:
+                fch, ffont, fsize = sc["book_char"], sc["book_font"], sc["book_size"]
+            else:
+                fch, ffont, fsize = sc["actual_char"], sc["actual_font"], \
+                    sc["actual_size"]
+        spec_changed = (fch, ffont, fsize) != (
+            cur_cells.get(cid, sc)["char"], cur_cells.get(cid, sc)["font"],
+            cur_cells.get(cid, sc)["size"])
+        before = cur_cells.get(cid, sc)["qty"]
+        if before != fq or not same or move_in.get(cid) or move_out.get(cid):
+            changes.append({
+                "cell_id": cid, "label": sc["cell_label"],
+                "book_char": sc["book_char"], "book_font": sc["book_font"],
+                "book_size": sc["book_size"], "book_qty": sc["book_qty"],
+                "actual_char": sc["actual_char"], "actual_font": sc["actual_font"],
+                "actual_size": sc["actual_size"], "actual_qty": sc["actual_qty"],
+                "before_qty": before, "final_qty": fq,
+                "final_char": fch, "final_font": ffont, "final_size": fsize,
+                "spec_changed": spec_changed,
+                "move_out": move_out.get(cid, 0), "move_in": move_in.get(cid, 0)})
+    return {"ready": not errors, "errors": errors, "warnings": warnings,
+            "changes": changes,
+            "n_short": sum(1 for d in stk["discrepancies"]
+                           if d["kind"] == "short"),
+            "n_surplus": sum(1 for d in stk["discrepancies"]
+                             if d["kind"] == "surplus"),
+            "n_review": sum(1 for d in stk["discrepancies"]
+                            if d["kind"] == "review")}
+
+
+@transactional
+def get_stocktake_detail(sid):
+    return {"ok": True, "stocktake": _load_stocktake(_get_stocktake_row(sid))}
+
+
+# ---------------------------------------------------------------- 差异决议
+
+
+def _reviewing(sid):
+    st = _get_stocktake_row(sid)
+    if st["status"] != "reviewing":
+        raise ApiError("只有差异复核阶段可以处理差异（当前：%s）"
+                       % STOCK_STATUS_NAMES.get(st["status"], st["status"]))
+    return st
+
+
+@transactional
+def decide_discrepancy(did, body):
+    """把差异剩余部分（错放配对之外）认定为盘盈或盘亏；入账前可撤销。"""
+    d = row("SELECT * FROM discrepancies WHERE id=?", (did,))
+    if not d:
+        raise ApiError("差异不存在", 404)
+    _reviewing(d["stocktake_id"])
+    decision = str(body.get("decision") or "").strip()
+    if decision not in ("gain", "loss"):
+        raise ApiError("决议类型应为 gain（盘盈）或 loss（盘亏）")
+    if d["kind"] == "review":
+        raise ApiError("待复核格位不能直接认定盘盈 / 盘亏，请先复盘该格")
+    if decision == "gain" and d["kind"] != "surplus":
+        raise ApiError("短缺项只能认定为盘亏")
+    if decision == "loss" and d["kind"] != "short":
+        raise ApiError("溢出项只能认定为盘盈")
+    covered = row("SELECT COALESCE(SUM(qty),0) AS n FROM discrepancy_pairs "
+                  "WHERE (src_disc_id=? OR dst_disc_id=?) AND status!= 'candidate'",
+                  (did, did))["n"]
+    if d["qty"] - covered <= 0:
+        raise ApiError("该差额已全部由错放移格 / 核销处理，无需再认定")
+    db.execute("UPDATE discrepancies SET decision=? WHERE id=?", (decision, did))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def revoke_discrepancy(did):
+    d = row("SELECT * FROM discrepancies WHERE id=?", (did,))
+    if not d:
+        raise ApiError("差异不存在", 404)
+    _reviewing(d["stocktake_id"])
+    if not d["decision"]:
+        raise ApiError("该差异还没有决议")
+    db.execute("UPDATE discrepancies SET decision='' WHERE id=?", (did,))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def create_move_task(pid, body):
+    """错放候选生成移格任务：来源格、目标格与数量固定，执行时依次复扫两端。"""
+    p = row("SELECT * FROM discrepancy_pairs WHERE id=?", (pid,))
+    if not p:
+        raise ApiError("错放候选不存在", 404)
+    _reviewing(p["stocktake_id"])
+    if p["status"] != "candidate":
+        raise ApiError("该候选已生成移格任务或已核销")
+    sid = p["stocktake_id"]
+    src = row("SELECT cell_id FROM discrepancies WHERE id=?", (p["src_disc_id"],))
+    dst = row("SELECT cell_id FROM discrepancies WHERE id=?", (p["dst_disc_id"],))
+    cur = db.execute(
+        "INSERT INTO move_tasks(stocktake_id,source_cell_id,target_cell_id,"
+        "spec_char,spec_font,spec_size,qty,status,created_at) "
+        "VALUES(?,?,?,?,?,?,?, 'pending', ?)",
+        (sid, src["cell_id"], dst["cell_id"], p["spec_char"], p["spec_font"],
+         p["spec_size"], p["qty"], now()))
+    mid = cur.lastrowid
+    db.execute("UPDATE discrepancy_pairs SET status='tasked', move_task_id=? "
+               "WHERE id=?", (mid, pid))
+    return {"ok": True, "move_task_id": mid, "state": get_state()}
+
+
+@transactional
+def writeoff_pair(pid):
+    """不安排移格：错放候选两端差额分别按盘盈（来源）、盘亏（目标）入账。"""
+    p = row("SELECT * FROM discrepancy_pairs WHERE id=?", (pid,))
+    if not p:
+        raise ApiError("错放候选不存在", 404)
+    _reviewing(p["stocktake_id"])
+    if p["status"] != "candidate":
+        raise ApiError("该候选已处理（已生成任务请先取消任务）")
+    db.execute("UPDATE discrepancy_pairs SET status='writeoff' WHERE id=?", (pid,))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def revoke_pair(pid):
+    """撤销候选上的移格任务 / 核销，恢复为待处理候选（未入账才可撤销）。"""
+    p = row("SELECT * FROM discrepancy_pairs WHERE id=?", (pid,))
+    if not p:
+        raise ApiError("错放候选不存在", 404)
+    _reviewing(p["stocktake_id"])
+    if p["status"] == "candidate":
+        raise ApiError("该候选还未处理")
+    if p["move_task_id"]:
+        # 未入账的移格记录（含已双端复扫）一并取消，候选恢复待处理
+        db.execute("UPDATE move_tasks SET status='cancelled' WHERE id=? AND status "
+                   "IN ('pending','src_ok','done')", (p["move_task_id"],))
+    db.execute("UPDATE discrepancy_pairs SET status='candidate', "
+               "move_task_id=NULL WHERE id=?", (pid,))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def cancel_move_task(mid):
+    m = row("SELECT * FROM move_tasks WHERE id=?", (mid,))
+    if not m:
+        raise ApiError("移格任务不存在", 404)
+    _reviewing(m["stocktake_id"])
+    if m["status"] not in ("pending", "src_ok", "done"):
+        raise ApiError("当前状态不能取消（已取消或已入账）")
+    db.execute("UPDATE move_tasks SET status='cancelled' WHERE id=?", (mid,))
+    db.execute("UPDATE discrepancy_pairs SET status='candidate', move_task_id=NULL "
+               "WHERE move_task_id=?", (mid,))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def scan_move_task(mid, body):
+    """依次复扫来源格、目标格：顺序错误 / 格号错误立即拦截，不自动改库存。"""
+    m = row("SELECT * FROM move_tasks WHERE id=?", (mid,))
+    if not m:
+        raise ApiError("移格任务不存在", 404)
+    _reviewing(m["stocktake_id"])
+    if m["status"] not in ("pending", "src_ok"):
+        raise ApiError("移格任务当前状态（%s）不能复扫"
+                       % m["status"])
+    label = str(body.get("label") or "").strip()
+    if not label:
+        raise ApiError("请扫描格号")
+    tray_id = row("SELECT tray_id FROM stocktakes WHERE id=?",
+                  (m["stocktake_id"],))["tray_id"]
+    stage = "source" if m["status"] == "pending" else "target"
+    expect_id = m["source_cell_id"] if stage == "source" else m["target_cell_id"]
+    expect = row("SELECT c.*, tr.name AS tray_name FROM cells c "
+                 "JOIN trays tr ON tr.id=c.tray_id WHERE c.id=?", (expect_id,))
+    scanned = row("SELECT c.*, tr.name AS tray_name FROM cells c "
+                  "JOIN trays tr ON tr.id=c.tray_id "
+                  "WHERE c.tray_id=? AND upper(c.label)=?",
+                  (tray_id, label.upper()))
+    if not scanned:
+        other = row("SELECT c.*, tr.name AS tray_name FROM cells c "
+                    "JOIN trays tr ON tr.id=c.tray_id WHERE upper(c.label)=?",
+                    (label.upper(),))
+        if other:
+            return stock_conflict(
+                "move_wrong_tray",
+                "扫到的格号「%s」属于字盘「%s」，移格只在本盘点字盘内进行"
+                % (other["label"], other["tray_name"]),
+                stage=stage, expected=expect, scanned=other)
+        return stock_conflict("move_unknown",
+                              "无法识别的格号「%s」" % label, stage=stage,
+                              expected=expect, label=label)
+    if scanned["id"] != expect_id:
+        return stock_conflict(
+            "move_wrong_cell",
+            ("请先复扫来源格" if stage == "source" else "来源格已确认，请复扫目标格")
+            + "：应为「%s」，扫到「%s」" % (expect["label"], scanned["label"]),
+            stage=stage, expected=expect, scanned=scanned, move=m)
+    if stage == "source":
+        db.execute("UPDATE move_tasks SET status='src_ok', src_scan=? WHERE id=?",
+                   (label, mid))
+    else:
+        db.execute("UPDATE move_tasks SET status='done', tgt_scan=?, done_at=? "
+                   "WHERE id=?", (label, now(), mid))
+        db.execute("UPDATE discrepancy_pairs SET status='moved' "
+                   "WHERE move_task_id=?", (mid,))
+    return {"ok": True, "stage_done": stage, "state": get_state()}
+
+
+# ---------------------------------------------------------------- 预览与入账
+
+
+@transactional
+def post_stocktake(sid):
+    """全部差异处理后一次性入账：先对齐实数，再执行移格，逐格保留前后值。"""
+    st = _reviewing(sid)
+    detail = _load_stocktake(st)
+    pv = detail["preview"]
+    if not pv or not pv["ready"]:
+        raise ApiError("尚有差异未处理，不能入账：" + "；".join(pv["errors"][:5]))
+    scs = {sc["cell_id"]: sc for sc in detail["cells"]}
+    done_moves = [mv for mv in detail["move_tasks"]
+                  if mv["status"] == "done"]
+    ts = now()
+    # 第一阶段：账面 → 实物（盘盈 / 盘亏 / 规格订正）
+    for cid, sc in scs.items():
+        if sc["status"] != "counted" or sc["actual_qty"] is None:
+            continue
+        target = row("SELECT * FROM cells WHERE id=?", (int(cid),))
+        before = target["qty"]
+        same_spec = (sc["actual_char"] == sc["book_char"]
+                     and sc["actual_font"] == sc["book_font"]
+                     and sc["actual_size"] == sc["book_size"])
+        # 同一格的对齐只记一条：规格不符记 spec（即便数量同时变化），
+        # 否则按数量增减记 gain / loss，数量与规格都不变则不留账
+        kind = ("spec" if not same_spec else
+                "gain" if sc["actual_qty"] > before else
+                "loss" if sc["actual_qty"] < before else "")
+        db.execute("UPDATE cells SET qty=?, char=?, font=?, size=? WHERE id=?",
+                   (int(sc["actual_qty"]), sc["actual_char"],
+                    sc["actual_font"], sc["actual_size"], int(cid)))
+        if kind:
+            db.execute(
+                "INSERT INTO postings(stocktake_id,cell_id,kind,qty,"
+                "before_qty,after_qty,created_at) VALUES(?,?,?,?,?,?,?)",
+                (sid, int(cid), kind,
+                 abs(int(sc["actual_qty"]) - int(before)), int(before),
+                 int(sc["actual_qty"]), ts))
+    # 第二阶段：执行已双端复扫的移格任务
+    for mv in done_moves:
+        src_id, tgt_id, q = (int(mv["source_cell_id"]),
+                             int(mv["target_cell_id"]), int(mv["qty"]))
+        src = row("SELECT * FROM cells WHERE id=?", (src_id,))
+        db.execute("UPDATE cells SET qty=qty-? WHERE id=?", (q, src_id))
+        after = int(src["qty"]) - q
+        db.execute(
+            "INSERT INTO postings(stocktake_id,cell_id,move_task_id,kind,qty,"
+            "before_qty,after_qty,created_at) "
+            "VALUES(?,?,?, 'move_out',?,?,?,?)",
+            (sid, src_id, int(mv["id"]), q, int(src["qty"]), after, ts))
+        tgt = row("SELECT * FROM cells WHERE id=?", (tgt_id,))
+        db.execute("UPDATE cells SET qty=qty+? WHERE id=?", (q, tgt_id))
+        after_t = int(tgt["qty"]) + q
+        db.execute(
+            "INSERT INTO postings(stocktake_id,cell_id,move_task_id,kind,qty,"
+            "before_qty,after_qty,created_at) "
+            "VALUES(?,?,?, 'move_in',?,?,?,?)",
+            (sid, tgt_id, int(mv["id"]), q, int(tgt["qty"]), after_t, ts))
+    # 规格恢复 / 订正（以预览计算的最终规格为准）
+    for ch in pv["changes"]:
+        db.execute("UPDATE cells SET char=?, font=?, size=? WHERE id=?",
+                   (ch["final_char"], ch["final_font"], ch["final_size"],
+                    int(ch["cell_id"])))
+    db.execute("UPDATE discrepancies SET posted=1 WHERE stocktake_id=?", (sid,))
+    db.execute("UPDATE discrepancy_pairs SET status='posted' WHERE stocktake_id=?",
+               (sid,))
+    db.execute("UPDATE move_tasks SET status='posted' WHERE stocktake_id=? "
+               "AND status='done'", (sid,))
+    db.execute("UPDATE stocktakes SET status='posted', posted_at=? WHERE id=?",
+               (ts, sid))
+    return {"ok": True, "state": get_state()}
+
+
 # ---------------------------------------------------------------- 备份恢复
 
-TABLES = ["trays", "cells", "sessions", "tasks", "pending_items", "actions"]
-DELETE_ORDER = ["actions", "pending_items", "tasks", "sessions", "cells",
+TABLES = ["trays", "cells", "sessions", "tasks", "pending_items", "actions",
+          "stocktakes", "stocktake_cells", "discrepancies",
+          "discrepancy_pairs", "move_tasks", "postings"]
+DELETE_ORDER = ["postings", "move_tasks", "discrepancy_pairs", "discrepancies",
+                "stocktake_cells", "stocktakes",
+                "actions", "pending_items", "tasks", "sessions", "cells",
                 "trays"]
 
 
 def backup():
     with DB_LOCK:
-        return {"app": "sortify", "version": 2, "exported_at": now(),
+        return {"app": "sortify", "version": 3, "exported_at": now(),
                 "tables": {t: rows("SELECT * FROM %s" % t) for t in TABLES}}
 
 
@@ -1166,8 +1976,7 @@ def restore(data):
                     r["tray_id"] = r.get("tray_id") or 1
                 _insert(t, r)
         # 显式指定 id 后刷新自增序列，避免后续主键冲突
-        for t in ("trays", "cells", "sessions", "tasks", "pending_items",
-                  "actions"):
+        for t in TABLES:
             mx = db.execute("SELECT COALESCE(MAX(id),0) AS m FROM %s" % t) \
                 .fetchone()["m"]
             db.execute(
@@ -1390,6 +2199,47 @@ def handle_api(method, path, body):
     m = re.fullmatch(r"/api/pending/(\d+)/resolve", path)
     if m and method == "POST":
         return resolve_pending(int(m.group(1)), body)
+
+    # ---- 盘点 ----
+    if method == "POST" and path == "/api/stocktakes":
+        return start_stocktake(body)
+    m = re.fullmatch(r"/api/stocktakes/(\d+)/(cancel|undo-count|post|recheck)",
+                     path)
+    if m and method == "POST":
+        sid, action = int(m.group(1)), m.group(2)
+        if action == "cancel":
+            return cancel_stocktake(sid)
+        if action == "undo-count":
+            return undo_count(sid)
+        if action == "post":
+            return post_stocktake(sid)
+        return recheck_cell(sid, body)
+    m = re.fullmatch(r"/api/stocktakes/(\d+)/count", path)
+    if m and method == "POST":
+        return count_stocktake_cell(int(m.group(1)), body)
+    m = re.fullmatch(r"/api/stocktakes/(\d+)", path)
+    if m and method == "GET":
+        return get_stocktake_detail(int(m.group(1)))
+    m = re.fullmatch(r"/api/discrepancies/(\d+)/(decide|revoke)", path)
+    if m and method == "POST":
+        did, action = int(m.group(1)), m.group(2)
+        if action == "decide":
+            return decide_discrepancy(did, body)
+        return revoke_discrepancy(did)
+    m = re.fullmatch(r"/api/pairs/(\d+)/(move|writeoff|revoke)", path)
+    if m and method == "POST":
+        pid, action = int(m.group(1)), m.group(2)
+        if action == "move":
+            return create_move_task(pid, body)
+        if action == "writeoff":
+            return writeoff_pair(pid)
+        return revoke_pair(pid)
+    m = re.fullmatch(r"/api/move-tasks/(\d+)/(scan|cancel)", path)
+    if m and method == "POST":
+        mid, action = int(m.group(1)), m.group(2)
+        if action == "scan":
+            return scan_move_task(mid, body)
+        return cancel_move_task(mid)
     raise ApiError("Not Found", 404)
 
 

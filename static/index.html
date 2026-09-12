@@ -11,6 +11,7 @@
   <h1>铅字归还助手</h1>
   <nav>
     <button class="nav-btn" data-view="run">归还作业</button>
+    <button class="nav-btn" data-view="stock">实体盘点 <span id="stockBadge" class="badge" hidden></span></button>
     <button class="nav-btn" data-view="tray">字盘编辑</button>
     <button class="nav-btn" data-view="pending">待确认 <span id="pendingBadge" class="badge" hidden></span></button>
     <button class="nav-btn" data-view="data">数据</button>
@@ -206,6 +207,27 @@
     </div>
   </section>
 
+  <!-- ============ 实体盘点 ============ -->
+  <section id="view-stock" class="view">
+    <div class="panel">
+      <div class="row between">
+        <h2>实体盘点</h2>
+        <span class="muted">扫描实体字盘码开始；盘点期间锁定该盘的归还确认与存量编辑</span>
+      </div>
+      <div class="scan-row">
+        <input id="stockStartInput" autocomplete="off"
+               placeholder="扫描字盘码后回车（如 TRAY-01）">
+        <button id="btnStockStart" class="primary">开始 / 继续盘点该盘</button>
+      </div>
+      <div id="stockActiveList"></div>
+    </div>
+    <div id="stockWork" hidden></div>
+    <div class="panel">
+      <h2>历史盘点单</h2>
+      <div id="stockHistory"></div>
+    </div>
+  </section>
+
   <!-- ============ 数据 ============ -->
   <section id="view-data" class="view">
     <div class="panel">
@@ -217,6 +239,12 @@
       <p class="hint">按当前批次（无进行中批次时为最近完成的批次）的换盘顺序
         与盘内次序，生成带<strong>字盘名、字盘码、格号</strong>的标签，打印后裁剪使用。</p>
       <button id="btnPrint">打印标签</button>
+    </div>
+    <div class="panel">
+      <h2>打印盘点差异单</h2>
+      <p class="hint">对当前差异复核中的盘点单（或最近一次已入账盘点单），按格打印
+        短缺、溢出、规格不符、错放候选与待复核项，供纸面核对签字。</p>
+      <button id="btnPrintStock">打印差异单</button>
     </div>
     <div class="panel">
       <h2>备份与恢复</h2>

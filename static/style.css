@@ -247,3 +247,67 @@ tr.tray-bad { background: #f9e6e1; }
 .gate-step { display: inline-block; padding: .15em .5em; }
 .gate-step.on { background: var(--next); color: #fff; border-radius: 3px; font-weight: bold; }
 .gate-step.fin { color: #9aa58c; text-decoration: line-through; }
+
+/* ---- 实体盘点 ---- */
+.stock-item {
+  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+  border: 1px solid var(--line); border-radius: 3px; padding: .5rem .7rem;
+  margin-top: .5rem; background: #faf6ec;
+}
+.stock-item.sel { border-color: var(--accent); background: var(--warn-bg); }
+.stock-item > div:first-child { flex: 1 1 auto; }
+.stock-item .row { margin-top: 0; }
+.stk-status {
+  display: inline-block; padding: .05em .5em; border-radius: 2px;
+  font-size: .78rem; background: #e7dfcb;
+}
+.stk-status.st-counting { background: var(--accent); color: #fff; }
+.stk-status.st-reviewing { background: var(--next); color: #fff; }
+.stk-status.st-posted { background: var(--done); color: #fff; }
+.stk-status.st-cancelled { background: #b0a890; color: #fff; }
+.stock-layout { display: flex; gap: 1rem; align-items: flex-start; }
+.stock-layout .tray-wrap.panel { padding: .6rem .8rem; }
+.stock-side { flex: 0 0 400px; max-width: 400px; }
+.stock-layout .panel:last-child { flex: 1 1 auto; }
+@media (max-width: 900px) {
+  .stock-layout { flex-direction: column; }
+  .stock-side { flex: 1 1 auto; max-width: none; width: 100%; }
+}
+.stock-field { display: flex; flex-direction: column; gap: .2rem; font-size: .85rem; margin: .4rem 0; }
+.stock-field input { padding: .45rem .55rem; }
+.spec-details { margin: .3rem 0; font-size: .85rem; }
+.stock-donelist { max-height: 220px; overflow: auto; font-size: .82rem; line-height: 1.8; }
+.stock-done.stk-mixed, .stock-done.stk-unrecognized, .stock-done.stk-blocked {
+  background: #f9e6e1; padding: 0 .3em; border-radius: 2px;
+}
+.cell.stock-cur rect { fill: #f9e3cd; stroke: var(--accent); stroke-width: 2.5; }
+.cell.stock-done rect { fill: #e2ead9; stroke: var(--done); }
+.cell.stock-flag rect { fill: #f6dcd4; stroke: var(--danger); stroke-width: 2; }
+.cell-sub { font-size: 9px; font-family: ui-monospace, monospace; font-weight: bold; }
+.cell-sub-down { fill: var(--danger); }
+.cell-sub-up { fill: var(--done); }
+.cell-sub-flag { fill: var(--danger); }
+.sw-stock-cur { background: #f9e3cd; border: 2px solid var(--accent); }
+.sw-stock-done { background: #e2ead9; border: 1px solid var(--done); }
+.sw-stock-flag { background: #f6dcd4; border: 1px solid var(--danger); }
+.stock-review .pair-line {
+  border: 1px solid var(--line); border-left-width: 3px; border-radius: 3px;
+  padding: .45rem .6rem; margin: .4rem 0; background: #faf6ec;
+}
+.pair-line.moved, .pair-line.posted { border-left-color: var(--done); }
+.pair-line.writeoff { border-left-color: #8a8070; }
+.pair-line.tasked { border-left-color: var(--next); }
+.move-scan {
+  margin-top: .5rem; padding: .5rem .6rem; border: 1px dashed var(--next);
+  border-radius: 3px; background: #eef4f8;
+}
+ul.stock-errors { margin: .3rem 0; padding-left: 1.2em; }
+ul.stock-errors li { font-size: .85rem; }
+
+/* ---- 打印盘点差异单 ---- */
+.stock-sheet { font-family: "Songti SC", "SimSun", serif; font-size: 10pt; color: #000; }
+.stock-sheet h2 { text-align: center; font-size: 16pt; margin: 0 0 4mm; }
+.stock-sheet p { line-height: 1.6; }
+.stock-sheet table { width: 100%; border-collapse: collapse; margin: 3mm 0; }
+.stock-sheet th, .stock-sheet td { border: 1px solid #000; padding: 1.5mm 2mm; text-align: left; }
+.stock-sheet .sign { margin-top: 8mm; font-size: 10pt; }
