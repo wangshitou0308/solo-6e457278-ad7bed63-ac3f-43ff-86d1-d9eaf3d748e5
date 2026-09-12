@@ -370,15 +370,101 @@ def get_tray(tray_id):
     return t
 
 
+def _unique_scan_code(preferred=""):
+    """为新字盘分配一个非空且全局唯一的扫描码。"""
+    used = {r["scan_code"].strip().upper()
+            for r in rows("SELECT scan_code FROM trays") if r["scan_code"]}
+
+    def free(c):
+        return c and c.strip().upper() not in used
+
+    p = (preferred or "").strip()
+    if free(p):
+        return p
+    if p:
+        for i in range(2, 100):
+            cand = "%s-%d" % (p, i)
+            if free(cand):
+                return cand
+    for i in range(1, 10000):
+        cand = "TRAY-%02d" % i
+        if free(cand):
+            return cand
+    return "TRAY-%d" % int(now().replace("-", "").replace(":", "")
+                           .replace(" ", ""))
+
+
+def _validate_scan_code(code, exclude_id=None):
+    """编辑字盘时校验：参与批次的扫描码必须非空且全局唯一。"""
+    code = (code or "").strip()
+    if not code:
+        raise ApiError("扫描码不能为空：每个字盘都要有可扫描的唯一字盘码")
+    q = "SELECT t.id, t.name FROM trays t WHERE upper(t.scan_code)=?"
+    args = [code.upper()]
+    if exclude_id is not None:
+        q += " AND t.id!=?"
+        args.append(exclude_id)
+    other = row(q, tuple(args))
+    if other:
+        raise ApiError("扫描码「%s」已被字盘「%s」使用，请改用唯一扫描码"
+                       % (code, other["name"]))
+    return code
+
+
+def normalize_scan_codes():
+    """修复既有数据：为空补码、为重复码保留首个并给其余重新分配。"""
+    used = set()
+    for t in rows("SELECT * FROM trays ORDER BY id"):
+        code = (t["scan_code"] or "").strip()
+        key = code.upper()
+        if code and key not in used:
+            used.add(key)
+            if code != t["scan_code"]:
+                db.execute("UPDATE trays SET scan_code=? WHERE id=?",
+                           (code, t["id"]))
+            continue
+        cand = _unique_scan_code(code)
+        used.add(cand.upper())
+        db.execute("UPDATE trays SET scan_code=? WHERE id=?", (cand, t["id"]))
+
+
+def _check_tray_codes(tray_ids):
+    """检查参与批次的字盘是否都有非空且唯一的扫描码。
+
+    返回 [{"id","name","problem"}, ...]，空列表表示全部正常。
+    """
+    ids = list(tray_ids)
+    trays = rows("SELECT * FROM trays WHERE id IN (%s) ORDER BY id"
+                 % ",".join("?" * len(ids)), tuple(ids)) if ids else []
+    seen, bad = {}, []
+    for t in trays:
+        code = (t["scan_code"] or "").strip()
+        if not code:
+            bad.append({"id": t["id"], "name": t["name"], "problem": "未设扫描码"})
+        elif code.upper() in seen:
+            bad.append({"id": t["id"], "name": t["name"],
+                        "problem": "扫描码「%s」与「%s」重复"
+                                   % (code, seen[code.upper()])})
+        else:
+            seen[code.upper()] = t["name"]
+    return bad
+
+
 @transactional
 def create_tray(body):
     name = str(body.get("name") or "").strip() or "新字盘"
+    # 未填则自动生成；填了但与现有码冲突则明确报错（避免悄悄改码）
     code = str(body.get("scan_code") or "").strip()
+    if code:
+        code = _validate_scan_code(code)
+    else:
+        code = _unique_scan_code()
     mx = row("SELECT COALESCE(MAX(sort_order),0) AS m FROM trays")["m"]
     cur = db.execute(
         "INSERT INTO trays(name,scan_code,sort_order,created_at) "
         "VALUES(?,?,?,?)", (name, code, mx + 10, now()))
-    return {"ok": True, "tray_id": cur.lastrowid, "state": get_state()}
+    return {"ok": True, "tray_id": cur.lastrowid, "scan_code": code,
+            "state": get_state()}
 
 
 @transactional
@@ -393,7 +479,7 @@ def update_tray(tray_id, body):
         args.append(name)
     if "scan_code" in body:
         sets.append("scan_code=?")
-        args.append(str(body.get("scan_code") or "").strip())
+        args.append(_validate_scan_code(body.get("scan_code"), tray_id))
     if sets:
         args.append(tray_id)
         db.execute("UPDATE trays SET %s WHERE id=?" % ", ".join(sets), args)
@@ -434,7 +520,9 @@ def duplicate_tray(tray_id, body):
     """复制布局：只复制格位结构（格号/坐标/尺寸/字种/容量），不带存量。"""
     src = get_tray(tray_id)
     name = str(body.get("name") or "").strip() or (src["name"] + "·副本")
+    # 副本是另一个实体字盘，必须分配独立扫描码：指定则校验，缺省自动生成
     code = str(body.get("scan_code") or "").strip()
+    code = _validate_scan_code(code) if code else _unique_scan_code()
     mx = row("SELECT COALESCE(MAX(sort_order),0) AS m FROM trays")["m"]
     cur = db.execute(
         "INSERT INTO trays(name,scan_code,sort_order,created_at) "
@@ -448,7 +536,8 @@ def duplicate_tray(tray_id, body):
             (nid, c["label"], c["char"], c["font"], c["size"],
              c["x"], c["y"], c["w"], c["h"], 0, c["capacity"]))
         n += 1
-    return {"ok": True, "tray_id": nid, "copied": n, "state": get_state()}
+    return {"ok": True, "tray_id": nid, "copied": n, "scan_code": code,
+            "state": get_state()}
 
 # ---------------------------------------------------------------- 格位 API
 
@@ -663,6 +752,12 @@ def plan_session(session_id, body):
     if lock:
         if sess["status"] == "active":
             raise ApiError("批次已开始执行")
+        bad = _check_tray_codes(task_trays)
+        if bad:
+            names = "；".join("「%s」%s" % (x["name"], x["problem"])
+                              for x in bad)
+            raise ApiError("以下字盘缺少唯一可扫描的字盘码，无法开始：" + names
+                           + "。请到字盘编辑页设置后再锁定。")
         start_tray = start or sess["start_tray_id"] or order[0]
         db.execute("UPDATE sessions SET status='active', locked=1, "
                    "tray_order=?, start_tray_id=?, current_tray_id=? "
@@ -1047,10 +1142,10 @@ def restore(data):
         db.execute("DELETE FROM %s" % t)
     tables = data["tables"]
     if ver < 2 or "trays" not in tables or not tables.get("trays"):
-        # v1 备份：全部格位归入「默认字盘」，保留归属
+        # v1 备份：全部格位归入「默认字盘」，保留归属；默认码非空唯一
         cur = db.execute(
             "INSERT INTO trays(id,name,scan_code,sort_order,created_at) "
-            "VALUES(1,?,?,0,?)", ("默认字盘", "", now()))
+            "VALUES(1,?,?,0,?)", ("默认字盘", "TRAY-01", now()))
         for r in tables.get("cells", []):
             r = dict(r)
             r.pop("tray_id", None)
@@ -1079,6 +1174,27 @@ def restore(data):
                 "INSERT OR REPLACE INTO sqlite_sequence(name,seq) VALUES(?,?)",
                 (t, mx))
     else:
+        # v2 备份也可能来自旧版本（空 / 重复扫描码）：插入前对整批托盘行
+        # 统一规整为空码补齐、重复码重新分配，避免插入时触发唯一索引
+        used = set()
+        for r in tables.get("trays", []):
+            if not isinstance(r, dict) or not r:
+                continue
+            code = str(r.get("scan_code") or "").strip()
+            if not code or code.upper() in used:
+                base = code
+                cand = None
+                n = 2
+                while True:
+                    cand = ("%s-%d" % (base, n)) if base else "TRAY-%02d" % n
+                    if cand.upper() not in used and not row(
+                            "SELECT id FROM trays WHERE upper(scan_code)=?",
+                            (cand.upper(),)):
+                        break
+                    n += 1
+                code = cand
+            r["scan_code"] = code
+            used.add(code.upper())
         for t in TABLES:
             for r in tables.get(t, []):
                 if isinstance(r, dict) and r:
@@ -1089,6 +1205,8 @@ def restore(data):
             db.execute(
                 "INSERT OR REPLACE INTO sqlite_sequence(name,seq) VALUES(?,?)",
                 (t, mx))
+    # 兜底：确保恢复后所有字盘都有非空唯一扫描码
+    normalize_scan_codes()
     return {"ok": True, "state": get_state()}
 
 
@@ -1193,6 +1311,10 @@ def init_db():
     with DB_LOCK:
         db.executescript(SCHEMA)
         _migrate()
+        # 修复既有空 / 重复扫描码后，再建立全局唯一索引兜底
+        normalize_scan_codes()
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trays_scan_code "
+                   "ON trays(lower(scan_code)) WHERE scan_code <> ''")
         # 盘内格号唯一索引：旧库在迁移加列之后才能创建
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cells_tray_label "
                    "ON cells(tray_id, label)")

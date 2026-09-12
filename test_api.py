@@ -428,14 +428,108 @@ def run_tests():
     check("检出已超容格", any(c["id"] == over_cell["id"]
                               for c in st["conflicts"]["overflow_cells"]))
 
-    print("== 16. 备份 / 恢复（v2，保留字盘归属）==")
+    print("== 16. 扫描码：非空、唯一、自动分配与编辑校验 ==")
+    code, st = call("GET", "/api/state")
+    # 先为后面的恢复测试留存一份正常数据备份
     code, bk = call("GET", "/api/backup")
-    check("导出 v2 备份", code == 200 and bk["app"] == "sortify"
-          and bk["version"] == 2)
+    base = st["trays"][0]["id"]
+    base_code = st["trays"][0]["scan_code"]
+    code, res = call("POST", "/api/trays", {})
+    check("新建字盘自动分配非空码",
+          res.get("ok") and bool(res["scan_code"]), str(res)[:150])
+    ta = res["tray_id"]
+    check("自动分配码与现有码不重复",
+          all(t["id"] == ta or t["scan_code"] != res["scan_code"]
+              for t in res["state"]["trays"]))
+    code, res = call("PUT", "/api/trays/%d" % ta, {"scan_code": "  "})
+    check("保存空扫描码被拒", code == 400)
+    code, res = call("PUT", "/api/trays/%d" % ta,
+                     {"scan_code": base_code})
+    check("保存重复扫描码被拒", code == 400)
+    code, res = call("PUT", "/api/trays/%d" % ta,
+                     {"scan_code": base_code.lower()})
+    check("大小写不同也视为重复", code == 400)
+    code, res = call("PUT", "/api/trays/%d" % ta,
+                     {"scan_code": "TRAY-UNIQUE-A"})
+    check("设置唯一扫描码成功", res.get("ok"))
+    # 复制布局必须给副本独立的扫描码
+    code, res = call("POST", "/api/trays/%d/duplicate" % base, {})
+    check("复制字盘自动分配独立码",
+          res.get("ok") and res["scan_code"] and
+          res["scan_code"] != base_code, str(res)[:150])
+    tb_dup = res["tray_id"]
+    code, res = call("POST", "/api/trays/%d/duplicate" % base,
+                     {"scan_code": base_code})
+    check("复制时指定重复码被拒", code == 400)
+
+    print("== 17. 既有数据修复：启动时补齐空码 / 重复码 ==")
+    # 直接写库制造一个空码和一个重复码（临时撤下唯一索引以便构造脏数据）
+    with server.DB_LOCK:
+        server.db.execute("DROP INDEX idx_trays_scan_code")
+        server.db.execute("UPDATE trays SET scan_code='' WHERE id=?", (ta,))
+        server.db.execute("UPDATE trays SET scan_code=? WHERE id=?",
+                          (base_code, tb_dup))
+        server.db.commit()
+    server.init_db()
+    code, st = call("GET", "/api/state")
+    codes = [t["scan_code"] for t in st["trays"]]
+    check("修复后无空扫描码", all(codes), str(codes))
+    check("修复后扫描码全局唯一", len(codes) == len(set(c.upper()
+                                                         for c in codes)),
+          str(codes))
+    check("原有正确码保持不变",
+          next(t for t in st["trays"] if t["id"] == base)["scan_code"]
+          == base_code)
+    check("唯一索引兜底存在", any(
+        r["name"] == "idx_trays_scan_code" for r in server.rows(
+            "SELECT name FROM sqlite_master WHERE type='index'")))
+
+    print("== 18. 锁定执行前拦截问题字盘 ==")
+    # 临时制造一个缺码字盘并放一个独有可匹配格位
+    code, res = call("POST", "/api/trays", {"name": "缺码盘",
+                                            "scan_code": "TRAY-FIXME"})
+    tn = res["tray_id"]
+    call("POST", "/api/cells/bulk", {"cells": [
+        {"tray_id": tn, "label": "N1", "char": "爵", "x": 20, "y": 20}]})
+    with server.DB_LOCK:
+        server.db.execute("DROP INDEX IF EXISTS idx_trays_scan_code")
+        server.db.execute("UPDATE trays SET scan_code='' WHERE id=?", (tn,))
+        server.db.commit()
+    code, res = call("POST", "/api/sessions", {"text": "爵 1"})
+    check("任务落在缺码字盘",
+          {t["tray_id"] for t in res["state"]["session"]["tasks"]} == {tn},
+          str(res)[:200])
+    sid = res["state"]["session"]["id"]
+    code, res = call("POST", "/api/sessions/%d/plan" % sid,
+                     {"tray_order": [tn], "start_tray_id": tn, "lock": True})
+    check("缺码字盘阻止锁定", code == 400 and "扫描码" in res.get("error", ""),
+          str(res)[:200])
+    # 修复后可锁定并完成扫码确认
+    server.init_db()
+    code, st = call("GET", "/api/state")
+    fixed = next(t["scan_code"] for t in st["trays"] if t["id"] == tn)
+    code, res = call("POST", "/api/sessions/%d/plan" % sid,
+                     {"tray_order": [tn], "start_tray_id": tn, "lock": True})
+    check("补齐码后可锁定", res.get("ok"), str(res)[:150])
+    code, res = call("POST", "/api/sessions/%d/confirm-tray" % sid,
+                     {"scan_code": fixed})
+    check("起始盘扫码后首格激活",
+          res.get("ok") and any(t["status"] == "active"
+                                for t in res["state"]["session"]["tasks"]),
+          str(res)[:200])
+    call("POST", "/api/sessions/%d/abandon" % sid, {})
+
+    print("== 19. 备份 / 恢复（v2，保留字盘归属）==")
+    # bk 在第 16 节开头、扫描码改动前留存
+    check("导出 v2 备份", bk["app"] == "sortify" and bk["version"] == 2)
     check("备份含 trays 表", "trays" in bk["tables"]
           and len(bk["tables"]["trays"]) >= 2)
     check("格位备份带 tray_id", all("tray_id" in c
                                     for c in bk["tables"]["cells"]))
+    check("备份中扫描码非空且唯一",
+          all(t.get("scan_code") for t in bk["tables"]["trays"]) and
+          len({t["scan_code"].upper() for t in bk["tables"]["trays"]})
+          == len(bk["tables"]["trays"]))
     n_trays = len(bk["tables"]["trays"])
     n_cells = len(bk["tables"]["cells"])
     call("DELETE", "/api/cells/%d" % bk["tables"]["cells"][-1]["id"])
@@ -447,7 +541,25 @@ def run_tests():
     code, res = call("POST", "/api/restore", {"bad": 1})
     check("坏备份被拒", code == 400)
 
-    print("== 17. v1 备份恢复：自动归入默认字盘 ==")
+    print("== 20. 恢复含空 / 重复扫描码的 v2 备份时自动修复 ==")
+    bad2 = json.loads(json.dumps(bk))
+    trs = bad2["tables"]["trays"]
+    trs[0]["scan_code"] = ""
+    if len(trs) > 1:
+        trs[1]["scan_code"] = trs[2]["scan_code"] if len(trs) > 2 \
+            else trs[0]["scan_code"] or "SAME"
+        if len(trs) == 2:
+            trs[0]["scan_code"] = trs[1]["scan_code"] = "SAME"
+    code, res = call("POST", "/api/restore", bad2)
+    check("含问题码的备份仍可恢复", res.get("ok"), str(res)[:200])
+    codes = [t["scan_code"] for t in res["state"]["trays"]]
+    check("恢复后扫描码被补齐且唯一",
+          all(codes) and len(codes) == len(set(c.upper() for c in codes)),
+          str(codes))
+    # 重新恢复干净备份，保证后续静态检查不受影响
+    call("POST", "/api/restore", bk)
+
+    print("== 21. v1 备份恢复：自动归入默认字盘 ==")
     v1 = {"app": "sortify", "version": 1, "tables": {
         "cells": [{"id": 901, "label": "V1A", "char": "甲", "font": "宋体",
                    "size": "五号", "x": 0, "y": 0, "w": 46, "h": 46,
@@ -463,7 +575,7 @@ def run_tests():
           st["cells"][0]["tray_id"] == st["trays"][0]["id"],
           str(st["cells"]))
 
-    print("== 18. 静态页面 ==")
+    print("== 22. 静态页面 ==")
     req = urllib.request.Request(BASE + "/")
     with urllib.request.urlopen(req) as r:
         html = r.read().decode("utf-8")

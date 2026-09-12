@@ -174,8 +174,12 @@ function switchView(v) {
 function focusRunInput() {
   const sess = S.session;
   if (!sess) { $('#pasteBox').focus(); return; }
-  if (sess.status === 'active' && !curTask()) $('#gateInput').focus();
-  else $('#scanInput').focus();
+  if (sess.status === 'active' && !curTask()) {
+    const gi = $('#gateInput');
+    if (gi) gi.focus();
+  } else {
+    $('#scanInput').focus();
+  }
 }
 
 /* ---------------- 会话派生状态 ---------------- */
@@ -192,15 +196,12 @@ function sessionOrder(sess) {
   return stored.length ? stored : fromTasks;
 }
 
-/* 换盘闸门：active 且当前没有进行中的格位任务 */
+/* 换盘闸门：active 且当前没有进行中的格位任务。
+   锁定起始盘后 current_tray_id 已指向起始盘、盘内任务仍全部 pending，
+   此时同样必须停在闸门，等待扫描字盘码后才激活首格。 */
 function gateExpectedTray(sess) {
   if (!sess || sess.status !== 'active') return null;
   if (curTask()) return null;
-  if (sess.current_tray_id &&
-      S.session.tasks.some((t) => t.status === 'pending' &&
-        t.tray_id === sess.current_tray_id)) {
-    return null;
-  }
   const pending = new Set(sess.tasks
     .filter((t) => t.status === 'pending').map((t) => t.tray_id));
   return sessionOrder(sess).find((id) => pending.has(id)) || null;
@@ -256,23 +257,44 @@ function renderPlanning(sess) {
   $('#planProgress').textContent =
     order.length + ' 个字盘 · ' + nTasks + ' 格 · ' + nQty + ' 枚';
   $('#planNoTask').hidden = nTasks > 0;
-  $('#btnLockPlan').disabled = nTasks === 0;
+
+  // 扫描码体检：参与批次的每个字盘都要有非空且唯一的可扫描码
+  const codeProblems = new Map();
+  const seen = new Map();
+  for (const tid of order) {
+    const tr = trayById(tid);
+    const code = (tr.scan_code || '').trim();
+    if (!code) codeProblems.set(tid, '未设扫描码');
+    else if (seen.has(code.toUpperCase())) {
+      codeProblems.set(tid, '与「' + seen.get(code.toUpperCase()) + '」扫描码重复');
+    } else seen.set(code.toUpperCase(), tr.name);
+  }
+  const hasBad = codeProblems.size > 0;
+  $('#btnLockPlan').disabled = nTasks === 0 || hasBad;
 
   const tb = $('#planTable tbody');
   tb.innerHTML = '';
   planOrder.forEach((tid, i) => {
     const tr = trayById(tid);
     if (!tr) return;
+    const problem = codeProblems.get(tid);
     const ts = sess.tasks.filter((t) => t.tray_id === tid);
     const qty = ts.reduce((a, t) => a + t.qty, 0);
     const trEl = document.createElement('tr');
+    trEl.className = problem ? 'tray-bad' : '';
     trEl.innerHTML =
       '<td>' + (i + 1) + '</td>' +
       '<td><b>' + esc(tr.name) + '</b></td>' +
-      '<td class="mono">' + esc(tr.scan_code || '（未设扫描码）') + '</td>' +
+      '<td class="mono">' +
+        (tr.scan_code ? esc(tr.scan_code)
+          : '<span class="diff-up">（未设扫描码）</span>') +
+        (problem && tr.scan_code
+          ? '<div class="diff-up">' + esc(problem) + '</div>' : '') +
+      '</td>' +
       '<td>' + ts.length + '</td><td>' + qty + '</td>' +
       '<td><label class="radio"><input type="radio" name="startTray" ' +
-        (startTrayId === tid ? 'checked' : '') + '> 起始盘</label></td>' +
+        (startTrayId === tid ? 'checked' : '') +
+        (problem ? ' disabled' : '') + '> 起始盘</label></td>' +
       '<td><button class="mini" data-act="up" ' + (i === 0 ? 'disabled' : '') +
         '>↑</button> <button class="mini" data-act="down" ' +
         (i === planOrder.length - 1 ? 'disabled' : '') + '>↓</button></td>';
@@ -281,6 +303,23 @@ function renderPlanning(sess) {
     trEl.querySelector('[data-act=down]').onclick = () => movePlanTray(i, 1);
     tb.appendChild(trEl);
   });
+
+  // 问题字盘提示
+  let warn = $('#planCodeWarn');
+  if (hasBad) {
+    if (!warn) {
+      warn = document.createElement('p');
+      warn.id = 'planCodeWarn';
+      warn.className = 'diff-up code-warn';
+      $('#btnLockPlan').parentNode.insertBefore(warn, $('#btnLockPlan'));
+    }
+    warn.innerHTML = '无法开始：以下字盘缺少唯一可扫描的字盘码 — ' +
+      order.filter((tid) => codeProblems.has(tid)).map((tid) =>
+        '「' + esc(trayById(tid).name) + '」' + codeProblems.get(tid)).join('；') +
+      '。请到「字盘编辑」页设置。';
+  } else if (warn) {
+    warn.remove();
+  }
 
   // 盘内次序预览
   $('#planGroups').innerHTML = planOrder.map((tid, i) => {
@@ -752,7 +791,8 @@ function bindTrayBar() {
     applyState(res.state);
     editTrayId = res.tray_id;
     renderAll();
-    toast('已新建字盘，请设置名称与扫描码');
+    toast('已新建字盘，自动分配扫描码 ' + res.scan_code +
+      '（可在上方改名 / 改码，扫描码不可为空或与其他字盘重复）');
   });
   $('#btnDupTray').onclick = () => guard(async () => {
     if (!editTrayId) return;
@@ -762,7 +802,8 @@ function bindTrayBar() {
     applyState(res.state);
     editTrayId = res.tray_id;
     renderAll();
-    toast('已复制布局：' + res.copied + ' 个格位（存量未复制）');
+    toast('已复制布局：' + res.copied + ' 个格位（存量未复制），新盘扫描码 ' +
+      res.scan_code);
   });
   $('#btnDelTray').onclick = () => guard(async () => {
     const t = trayById(editTrayId);
@@ -776,12 +817,20 @@ function bindTrayBar() {
       { name: ev.target.value })).state);
     toast('字盘名称已保存');
   }));
-  $('#tfCode').addEventListener('change', (ev) => guard(async () => {
+  $('#tfCode').addEventListener('change', async (ev) => {
     if (!editTrayId) return;
-    applyState((await api('/api/trays/' + editTrayId, 'PUT',
-      { scan_code: ev.target.value })).state);
-    toast('字盘扫描码已保存');
-  }));
+    const prev = (trayById(editTrayId) || {}).scan_code || '';
+    try {
+      const res = await api('/api/trays/' + editTrayId, 'PUT',
+        { scan_code: ev.target.value });
+      applyState(res.state);
+      toast('字盘扫描码已保存');
+    } catch (e) {
+      // 校验失败：回滚输入框为已保存的值并明确提示
+      ev.target.value = prev;
+      toast(e.message, true);
+    }
+  });
 }
 
 function bindCellForm() {
