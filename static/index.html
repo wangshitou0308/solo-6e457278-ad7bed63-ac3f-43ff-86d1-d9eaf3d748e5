@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>铅字归还助手</title>
+<title>铅字归还助手 · 多字盘换盘导航</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -34,6 +34,7 @@
       <h2>粘贴待归还清单</h2>
       <p class="hint">每行一条：<code>字符 数量 [字体] [字号]</code>，也支持
         <code>永×12</code>、<code>永,12,宋体,五号</code>。
+        系统会按目标<strong>字盘</strong>自动归组、盘内蛇形规划；
         合字、异体字与无法辨认（<code>?</code>）的铅字会自动列入「待确认」。</p>
       <textarea id="pasteBox" rows="8" placeholder="例如：&#10;的 12&#10;永×3 宋体 五号&#10;體 2&#10;囍 1&#10;? 1"></textarea>
       <div class="row">
@@ -41,15 +42,55 @@
       </div>
     </div>
 
+    <!-- 规划页：先按字盘归组，调整并锁定换盘顺序、指定起始盘 -->
+    <div id="runPlan" hidden>
+      <div class="plan-layout">
+        <div class="panel">
+          <div class="row between">
+            <h2 id="planTitle">换盘规划</h2>
+            <span id="planProgress" class="muted"></span>
+          </div>
+          <p class="hint">已按目标字盘自动归组，并在每个盘内按蛇形次序规划格位。
+            可上下调整<strong>换盘顺序</strong>、指定<strong>起始盘</strong>；
+            锁定后执行中不能再改。跨盘前必须扫描实体字盘码核对。</p>
+          <table class="tasks" id="planTable">
+            <thead><tr><th>顺序</th><th>字盘</th><th>字盘码</th><th>格位数</th><th>铅字枚数</th><th>起始盘</th><th>调整</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div class="row">
+            <button id="btnLockPlan" class="primary">锁定顺序，开始执行</button>
+            <button id="btnPlanAbandon" class="danger">作废批次</button>
+          </div>
+          <p id="planNoTask" class="hint" hidden>
+            本批暂无可执行格位（全部进入「待确认」）。请到「待确认」页归位后再锁定。</p>
+        </div>
+        <div class="panel">
+          <h3>盘内格位次序预览</h3>
+          <div id="planGroups"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 执行页 -->
     <div id="runActive" hidden>
       <div class="run-layout">
         <div class="tray-wrap">
-          <svg id="runTray" class="tray" role="img" aria-label="字盘"></svg>
+          <div class="tray-titlebar">
+            <h2 id="runTrayName">字盘</h2>
+            <span id="runTrayCode" class="muted"></span>
+          </div>
+          <svg id="runTray" class="tray" role="img" aria-label="当前字盘"></svg>
           <div class="legend">
             <span><i class="sw sw-cur"></i>当前格</span>
-            <span><i class="sw sw-next"></i>下一格</span>
+            <span><i class="sw sw-next"></i>盘内下一格</span>
             <span><i class="sw sw-done"></i>已完成</span>
             <span><i class="sw sw-over"></i>超容</span>
+          </div>
+
+          <!-- 换盘闸门：跨盘前扫描字盘码 -->
+          <div id="gatePanel" class="panel gate" hidden>
+            <h3>请更换字盘并扫描字盘码</h3>
+            <div id="gateBody"></div>
           </div>
         </div>
         <div class="run-side">
@@ -58,13 +99,14 @@
               <h2 id="sessTitle">批次</h2>
               <span id="sessProgress" class="muted"></span>
             </div>
+            <div id="traySwitchHint" class="tray-hint"></div>
             <div class="progress"><div id="progressBar"></div></div>
 
             <div id="curTask" class="cur-task"></div>
 
             <div class="scan-row">
               <input id="scanInput" autocomplete="off"
-                     placeholder="扫描 / 输入格号后回车（空回车＝确认当前格）">
+                     placeholder="扫描 / 输入当前盘格号后回车（空回车＝确认当前格）">
               <input id="qtyInput" type="number" min="1" title="本次放入数量（默认全部）">
             </div>
             <div class="row">
@@ -81,11 +123,8 @@
           <div id="conflictPanel" class="panel conflict" hidden></div>
 
           <div class="panel">
-            <h3>取放顺序（蛇形规划）</h3>
-            <table class="tasks" id="taskTable">
-              <thead><tr><th>#</th><th>格号</th><th>字</th><th>数量</th><th>状态</th></tr></thead>
-              <tbody></tbody>
-            </table>
+            <h3>换盘与格位顺序</h3>
+            <div id="trayGroups"></div>
           </div>
         </div>
       </div>
@@ -93,7 +132,25 @@
   </section>
 
   <!-- ============ 字盘编辑 ============ -->
-  <section id="view-tray" class="view" hidden>
+  <section id="view-tray" class="view">
+    <div class="panel tray-bar">
+      <div class="row">
+        <label>当前字盘
+          <select id="traySelect"></select>
+        </label>
+        <button id="btnTrayUp" title="前移显示顺序">↑</button>
+        <button id="btnTrayDown" title="后移显示顺序">↓</button>
+        <button id="btnNewTray" class="primary">新建字盘</button>
+        <button id="btnDupTray" title="只复制格位结构，不带存量">复制此盘布局</button>
+        <button id="btnDelTray" class="danger">删除此盘</button>
+      </div>
+      <div class="form tray-form">
+        <label>字盘名称 <input id="tfName" placeholder="如：二号宋体盘"></label>
+        <label>扫描码（贴在实体字盘上的条码内容） <input id="tfCode" placeholder="如 TRAY-02"></label>
+      </div>
+      <p class="hint">格号只需在同一字盘内唯一；每个字盘的布局、存量互相独立。
+        「复制此盘布局」会复制全部格位的格号、坐标、尺寸与字种，但存量清零。</p>
+    </div>
     <div class="tray-layout">
       <div class="tray-wrap">
         <svg id="editTray" class="tray" role="img" aria-label="字盘编辑"></svg>
@@ -119,7 +176,7 @@
           <button id="btnNewCell">新建格位</button>
         </div>
         <div class="panel">
-          <h3>批量成行</h3>
+          <h3>批量成行（加入当前字盘）</h3>
           <div class="form">
             <label>格号前缀 <input id="gPrefix" value="H"></label>
             <label>列数 <input id="gCols" type="number" value="8" min="1"></label>
@@ -135,12 +192,12 @@
   </section>
 
   <!-- ============ 待确认 ============ -->
-  <section id="view-pending" class="view" hidden>
+  <section id="view-pending" class="view">
     <div class="panel">
       <h2>待确认铅字</h2>
-      <p class="hint">合字、异体字与无法辨认的铅字在此暂列。指定目标格后归位（将追加到当前归还批次），或忽略。</p>
+      <p class="hint">合字、异体字与无法辨认的铅字在此暂列。指定目标格后归位（将追加到当前归还批次对应字盘的顺序末尾），或忽略。</p>
       <table class="tasks" id="pendingTable">
-        <thead><tr><th>字符</th><th>数量</th><th>原因</th><th>说明</th><th>目标格</th><th></th></tr></thead>
+        <thead><tr><th>字符</th><th>数量</th><th>原因</th><th>说明</th><th>目标格（字盘 / 格号）</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
       <p id="pendingEmpty" class="hint" hidden>没有待确认的铅字。</p>
@@ -148,19 +205,20 @@
   </section>
 
   <!-- ============ 数据 ============ -->
-  <section id="view-data" class="view" hidden>
+  <section id="view-data" class="view">
     <div class="panel">
       <h2>容量冲突检查</h2>
       <div id="conflictList"></div>
     </div>
     <div class="panel">
       <h2>打印临时分拣标签</h2>
-      <p class="hint">按当前批次（无进行中批次时为最近完成的批次）的取放顺序，
-        生成带格号与坐标的标签，打印后裁剪使用。</p>
+      <p class="hint">按当前批次（无进行中批次时为最近完成的批次）的换盘顺序
+        与盘内次序，生成带<strong>字盘名、字盘码、格号</strong>的标签，打印后裁剪使用。</p>
       <button id="btnPrint">打印标签</button>
     </div>
     <div class="panel">
       <h2>备份与恢复</h2>
+      <p class="hint">备份包含全部字盘及其归属（旧版单字盘备份恢复时自动归入「默认字盘」）。</p>
       <div class="row">
         <button id="btnBackup">导出 JSON 备份</button>
         <label class="btn-file">恢复备份<input id="restoreFile" type="file" accept=".json" hidden></label>

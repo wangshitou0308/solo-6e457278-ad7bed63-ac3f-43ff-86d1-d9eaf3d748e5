@@ -188,6 +188,60 @@ tr.t-skip { color: #b0a890; }
     page-break-inside: avoid; font-family: "Songti SC", "SimSun", serif;
   }
   .label-card .lc-head { display: flex; justify-content: space-between; font-size: 9pt; }
+  .label-card .lc-code { font-size: 11pt; margin: 1mm 0; }
   .label-card .lc-char { font-size: 22pt; text-align: center; line-height: 1.3; }
   .label-card .lc-meta { font-size: 8pt; line-height: 1.5; }
 }
+
+/* ---- 字盘管理栏 ---- */
+.tray-bar .row label { display: flex; align-items: center; gap: .4rem; font-size: .85rem; color: #7a7160; }
+.tray-bar select { min-width: 12rem; }
+.tray-form { margin-top: .6rem; grid-template-columns: 1fr 1fr; }
+button.mini { padding: .1rem .45rem; font-size: .85rem; }
+.mono { font-family: ui-monospace, monospace; font-size: .9em; }
+.dim { color: #9a917e; }
+
+/* ---- 规划页 ---- */
+.plan-layout { display: flex; gap: 1rem; align-items: flex-start; }
+.plan-layout > .panel:first-child { flex: 1 1 55%; }
+.plan-layout > .panel:last-child { flex: 1 1 45%; }
+@media (max-width: 900px) { .plan-layout { flex-direction: column; } }
+.radio { display: inline-flex; align-items: center; gap: .25rem; white-space: nowrap; }
+.pgroup { border-left: 3px solid var(--line); padding: .3rem .6rem; margin-bottom: .5rem; background: #faf6ec; border-radius: 0 3px 3px 0; }
+.pgroup.start { border-left-color: var(--accent); background: var(--warn-bg); }
+.pgroup h4 { margin: 0 0 .25rem; font-size: .9rem; }
+.start-tag { color: var(--accent); font-size: .8rem; }
+.mini-seq { margin: 0; font-size: .8rem; color: #5f5747; line-height: 1.7; }
+
+/* ---- 执行页：字盘标题 / 换盘提示 ---- */
+.tray-titlebar { display: flex; align-items: baseline; gap: .8rem; margin-bottom: .3rem; }
+.tray-titlebar h2 { margin: 0; font-size: 1.05rem; }
+.tray-hint {
+  font-size: .85rem; line-height: 1.5; background: #f1ecdd;
+  border-radius: 3px; padding: .4rem .6rem; margin-bottom: .5rem;
+}
+.tgroup { border: 1px solid var(--line); border-radius: 3px; padding: .35rem .5rem; margin-bottom: .4rem; background: #faf6ec; }
+.tgroup.cur { border-color: var(--accent); background: #fdf4ea; }
+.tgroup.gate { border-color: var(--next); background: #e8f0f5; }
+.tgroup.done { opacity: .6; }
+.tg-head { display: flex; align-items: center; gap: .4rem; font-size: .85rem; }
+.tg-prog { margin-left: auto; color: #7a7160; font-size: .8rem; }
+.tg-cells { margin-top: .25rem; line-height: 1.9; }
+.tg-cell {
+  display: inline-block; font-size: .72rem; font-family: ui-monospace, monospace;
+  padding: 0 .35em; border-radius: 2px; margin-right: 2px;
+  background: #e7dfcb; color: #5f5747;
+}
+.tg-cell.st-active { background: var(--accent); color: #fff; }
+.tg-cell.st-done { background: var(--done); color: #fff; }
+.tg-cell.st-skipped { background: #b0a890; color: #fff; text-decoration: line-through; }
+
+/* ---- 换盘闸门 ---- */
+.panel.gate { border-color: var(--next); background: #eef4f8; }
+.panel.gate h3 { color: var(--next); margin: 0 0 .5rem; }
+.gate-expect { font-size: .95rem; margin-bottom: .5rem; }
+.gate-msg { min-height: 1.2em; margin-top: .4rem; font-size: .85rem; }
+.gate-seq { margin-top: .5rem; font-size: .8rem; color: #5f5747; }
+.gate-step { display: inline-block; padding: .15em .5em; }
+.gate-step.on { background: var(--next); color: #fff; border-radius: 3px; font-weight: bold; }
+.gate-step.fin { color: #9aa58c; text-decoration: line-through; }

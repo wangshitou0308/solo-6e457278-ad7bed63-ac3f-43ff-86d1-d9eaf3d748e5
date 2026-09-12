@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 """铅字归还助手 —— 活字印刷工坊拆版后归还铅字的本地 Web 工具。
 
+支持多个实体字盘（tray）：每个字盘可命名、设置扫描码并单独编辑布局；
+归还批次先按目标字盘归组、盘内蛇形规划，可指定起始盘并锁定换盘顺序，
+跨盘前必须扫描字盘码核对，执行页只绘制当前字盘。
+
 仅依赖 Python 标准库（http.server + sqlite3），断网即可运行。
 
 用法:
@@ -29,12 +33,20 @@ db.row_factory = sqlite3.Row
 db.execute("PRAGMA foreign_keys = ON")
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS trays (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL DEFAULT '',
+  scan_code  TEXT NOT NULL DEFAULT '',   -- 实体字盘上的条码 / 二维码内容
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS cells (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
-  label     TEXT NOT NULL UNIQUE,      -- 格号（扫描标签）
-  char      TEXT NOT NULL DEFAULT '',  -- 字符，空串 = 空格位
-  font      TEXT NOT NULL DEFAULT '',  -- 字体
-  size      TEXT NOT NULL DEFAULT '',  -- 字号
+  tray_id   INTEGER NOT NULL REFERENCES trays(id),
+  label     TEXT NOT NULL,               -- 格号（扫描标签），同一字盘内唯一
+  char      TEXT NOT NULL DEFAULT '',    -- 字符，空串 = 空格位
+  font      TEXT NOT NULL DEFAULT '',    -- 字体
+  size      TEXT NOT NULL DEFAULT '',    -- 字号
   x REAL NOT NULL DEFAULT 0,  y REAL NOT NULL DEFAULT 0,
   w REAL NOT NULL DEFAULT 46, h REAL NOT NULL DEFAULT 46,
   qty      INTEGER NOT NULL DEFAULT 0,   -- 当前数量
@@ -43,13 +55,18 @@ CREATE TABLE IF NOT EXISTS cells (
 CREATE TABLE IF NOT EXISTS sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'active',   -- active / done / abandoned
+  status TEXT NOT NULL DEFAULT 'planning', -- planning / active / done / abandoned
   created_at TEXT NOT NULL,
-  finished_at TEXT
+  finished_at TEXT,
+  tray_order TEXT NOT NULL DEFAULT '[]',   -- JSON：规划/锁定后的换盘顺序
+  start_tray_id INTEGER,                   -- 操作员指定的起始盘
+  locked INTEGER NOT NULL DEFAULT 0,       -- 换盘顺序是否已锁定
+  current_tray_id INTEGER                  -- 当前执行盘（确认换盘后推进）
 );
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id INTEGER NOT NULL REFERENCES sessions(id),
+  tray_id INTEGER NOT NULL REFERENCES trays(id),
   cell_id INTEGER REFERENCES cells(id),
   char TEXT NOT NULL,
   font TEXT NOT NULL DEFAULT '',
@@ -57,7 +74,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   qty INTEGER NOT NULL,                    -- 本批应还数量
   done_qty INTEGER NOT NULL DEFAULT 0,     -- 已确认数量
   status TEXT NOT NULL DEFAULT 'pending',  -- pending / active / done / skipped
-  seq INTEGER NOT NULL DEFAULT 0,          -- 规划顺序
+  seq INTEGER NOT NULL DEFAULT 0,          -- 盘内规划顺序
   note TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS pending_items (
@@ -260,30 +277,36 @@ def capacity_conflicts(cells, session):
     return {"overflow_cells": over, "projected": projected}
 
 
+TASK_COLS = ("SELECT t.*, c.label, c.x, c.y, c.qty AS cell_qty, "
+             "c.capacity, tr.name AS tray_name, tr.scan_code AS tray_code "
+             "FROM tasks t "
+             "LEFT JOIN cells c ON c.id = t.cell_id "
+             "JOIN trays tr ON tr.id = t.tray_id ")
+
+
+def _load_session(sess):
+    sess = dict(sess)
+    sess["tasks"] = rows(TASK_COLS + "WHERE t.session_id=? ORDER BY t.seq",
+                         (sess["id"],))
+    sess["tray_order"] = _loads(sess.get("tray_order") or "[]")
+    return sess
+
+
 def get_state():
     with DB_LOCK:
-        cells = rows("SELECT * FROM cells ORDER BY y, x, id")
-        task_cols = ("SELECT t.*, c.label, c.x, c.y, c.qty AS cell_qty, "
-                     "c.capacity FROM tasks t "
-                     "LEFT JOIN cells c ON c.id = t.cell_id "
-                     "WHERE t.session_id=? ORDER BY t.seq")
-        sess = row("SELECT * FROM sessions WHERE status='active' "
+        trays = rows("SELECT * FROM trays ORDER BY sort_order, id")
+        cells = rows("SELECT * FROM cells ORDER BY tray_id, y, x, id")
+        sess = row("SELECT * FROM sessions WHERE status IN ('planning','active') "
                    "ORDER BY id DESC LIMIT 1")
-        session = None
-        if sess:
-            session = dict(sess)
-            session["tasks"] = rows(task_cols, (sess["id"],))
+        session = _load_session(sess) if sess else None
         # 最近完成的批次：供完成页撤销收尾、补打标签
         ds = row("SELECT * FROM sessions WHERE status='done' "
                  "ORDER BY id DESC LIMIT 1")
-        last_done = None
-        if ds:
-            last_done = dict(ds)
-            last_done["tasks"] = rows(task_cols, (ds["id"],))
+        last_done = _load_session(ds) if ds else None
         pending = rows("SELECT * FROM pending_items WHERE status='open' "
                        "ORDER BY id")
-        return {"cells": cells, "session": session, "last_done": last_done,
-                "pending": pending,
+        return {"trays": trays, "cells": cells, "session": session,
+                "last_done": last_done, "pending": pending,
                 "conflicts": capacity_conflicts(cells, session),
                 "reason_names": REASON_NAMES}
 
@@ -293,6 +316,140 @@ def conflict(ctype, message, **kw):
     c.update(kw)
     return {"ok": False, "conflict": c, "state": get_state()}
 
+
+def _loads(s):
+    try:
+        v = json.loads(s or "[]")
+        return v if isinstance(v, list) else []
+    except (ValueError, TypeError):
+        return []
+
+
+def _tray_ids(session):
+    """会话换盘顺序：优先锁定/规划顺序，回退按盘内任务推导。"""
+    ordered = [i for i in (session.get("tray_order") or []) if isinstance(i, int)]
+    if ordered:
+        return ordered
+    return sorted({t["tray_id"] for t in session["tasks"]})
+
+# ---------------------------------------------------------------- 推进逻辑
+
+
+def _advance(session_id):
+    """确认 / 跳过之后推进：激活下一格或下一盘；全部完成则结束批次。
+
+    只激活当前盘内的下一个任务；跨盘时进入等待扫描字盘码的闸门状态。
+    """
+    sess = row("SELECT * FROM sessions WHERE id=?", (session_id,))
+    if not sess or sess["status"] not in ("active",):
+        return
+    cur_tray = sess["current_tray_id"]
+    nxt = row("SELECT id FROM tasks WHERE session_id=? AND status='pending' "
+              "AND tray_id=? ORDER BY seq LIMIT 1", (session_id, cur_tray))
+    if nxt:
+        db.execute("UPDATE tasks SET status='active' WHERE id=?", (nxt["id"],))
+        return
+    left = row("SELECT COUNT(*) AS n FROM tasks WHERE session_id=? "
+               "AND status IN ('pending','active')", (session_id,))["n"]
+    if left == 0:
+        db.execute("UPDATE sessions SET status='done', finished_at=? "
+                   "WHERE id=?", (now(), session_id))
+
+
+def _current_task(session_id):
+    return row("SELECT * FROM tasks WHERE session_id=? AND status='active' "
+               "ORDER BY seq LIMIT 1", (session_id,))
+
+# ---------------------------------------------------------------- 字盘 API
+
+
+def get_tray(tray_id):
+    t = row("SELECT * FROM trays WHERE id=?", (tray_id,))
+    if not t:
+        raise ApiError("字盘不存在", 404)
+    return t
+
+
+@transactional
+def create_tray(body):
+    name = str(body.get("name") or "").strip() or "新字盘"
+    code = str(body.get("scan_code") or "").strip()
+    mx = row("SELECT COALESCE(MAX(sort_order),0) AS m FROM trays")["m"]
+    cur = db.execute(
+        "INSERT INTO trays(name,scan_code,sort_order,created_at) "
+        "VALUES(?,?,?,?)", (name, code, mx + 10, now()))
+    return {"ok": True, "tray_id": cur.lastrowid, "state": get_state()}
+
+
+@transactional
+def update_tray(tray_id, body):
+    get_tray(tray_id)
+    sets, args = [], []
+    if "name" in body:
+        name = str(body.get("name") or "").strip()
+        if not name:
+            raise ApiError("字盘名称不能为空")
+        sets.append("name=?")
+        args.append(name)
+    if "scan_code" in body:
+        sets.append("scan_code=?")
+        args.append(str(body.get("scan_code") or "").strip())
+    if sets:
+        args.append(tray_id)
+        db.execute("UPDATE trays SET %s WHERE id=?" % ", ".join(sets), args)
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def delete_tray(tray_id):
+    t = get_tray(tray_id)
+    if row("SELECT COUNT(*) AS n FROM trays")["n"] <= 1:
+        raise ApiError("至少保留一个字盘")
+    if row("SELECT COUNT(*) AS n FROM cells WHERE tray_id=?",
+           (tray_id,))["n"]:
+        raise ApiError("字盘「%s」中仍有格位，请先清空" % t["name"])
+    if row("SELECT COUNT(*) AS n FROM tasks WHERE tray_id=?",
+           (tray_id,))["n"]:
+        raise ApiError("字盘「%s」已有归还任务记录，不能删除" % t["name"])
+    db.execute("DELETE FROM trays WHERE id=?", (tray_id,))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def reorder_trays(body):
+    order = body.get("order") or []
+    if not isinstance(order, list) or not all(isinstance(i, int) for i in order):
+        raise ApiError("顺序格式不正确")
+    existing = {r["id"] for r in rows("SELECT id FROM trays")}
+    if set(order) != existing:
+        raise ApiError("顺序必须包含全部字盘且不重复")
+    for i, tid in enumerate(order):
+        db.execute("UPDATE trays SET sort_order=? WHERE id=?",
+                   (i * 10, tid))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def duplicate_tray(tray_id, body):
+    """复制布局：只复制格位结构（格号/坐标/尺寸/字种/容量），不带存量。"""
+    src = get_tray(tray_id)
+    name = str(body.get("name") or "").strip() or (src["name"] + "·副本")
+    code = str(body.get("scan_code") or "").strip()
+    mx = row("SELECT COALESCE(MAX(sort_order),0) AS m FROM trays")["m"]
+    cur = db.execute(
+        "INSERT INTO trays(name,scan_code,sort_order,created_at) "
+        "VALUES(?,?,?,?)", (name, code, mx + 10, now()))
+    nid = cur.lastrowid
+    n = 0
+    for c in rows("SELECT * FROM cells WHERE tray_id=? ORDER BY id", (tray_id,)):
+        db.execute(
+            "INSERT INTO cells(tray_id,label,char,font,size,x,y,w,h,"
+            "qty,capacity) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (nid, c["label"], c["char"], c["font"], c["size"],
+             c["x"], c["y"], c["w"], c["h"], 0, c["capacity"]))
+        n += 1
+    return {"ok": True, "tray_id": nid, "copied": n, "state": get_state()}
+
 # ---------------------------------------------------------------- 格位 API
 
 
@@ -300,21 +457,32 @@ CELL_FIELDS = ("label", "char", "font", "size", "x", "y", "w", "h",
                "qty", "capacity")
 
 
+def _cell_tray(body, default=None):
+    tid = body.get("tray_id", default)
+    if tid is None:
+        t = row("SELECT id FROM trays ORDER BY sort_order, id LIMIT 1")
+        tid = t["id"] if t else None
+    return int(tid)
+
+
 @transactional
 def create_cell(body):
+    tray_id = _cell_tray(body)
+    get_tray(tray_id)
     label = str(body.get("label") or "").strip()
     if not label:
         raise ApiError("格号不能为空")
-    if row("SELECT id FROM cells WHERE label=?", (label,)):
-        raise ApiError("格号「%s」已存在" % label)
+    if row("SELECT id FROM cells WHERE tray_id=? AND label=?",
+           (tray_id, label)):
+        raise ApiError("字盘内格号「%s」已存在" % label)
     db.execute(
-        "INSERT INTO cells(label,char,font,size,x,y,w,h,qty,capacity) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?)",
-        (label, str(body.get("char") or ""), str(body.get("font") or ""),
-         str(body.get("size") or ""), float(body.get("x") or 0),
-         float(body.get("y") or 0), float(body.get("w") or 46),
-         float(body.get("h") or 46), int(body.get("qty") or 0),
-         int(body.get("capacity") or 50)))
+        "INSERT INTO cells(tray_id,label,char,font,size,x,y,w,h,qty,capacity) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (tray_id, label, str(body.get("char") or ""),
+         str(body.get("font") or ""), str(body.get("size") or ""),
+         float(body.get("x") or 0), float(body.get("y") or 0),
+         float(body.get("w") or 46), float(body.get("h") or 46),
+         int(body.get("qty") or 0), int(body.get("capacity") or 50)))
     return {"ok": True, "state": get_state()}
 
 
@@ -323,6 +491,8 @@ def update_cell(cell_id, body):
     cell = row("SELECT * FROM cells WHERE id=?", (cell_id,))
     if not cell:
         raise ApiError("格位不存在", 404)
+    if "tray_id" in body and int(body["tray_id"]) != cell["tray_id"]:
+        raise ApiError("不能把格位移到另一个字盘，请在目标盘新建")
     sets, args = [], []
     for f in CELL_FIELDS:
         if f not in body:
@@ -337,10 +507,10 @@ def update_cell(cell_id, body):
         if f == "label":
             if not v:
                 raise ApiError("格号不能为空")
-            dup = row("SELECT id FROM cells WHERE label=? AND id!=?",
-                      (v, cell_id))
+            dup = row("SELECT id FROM cells WHERE tray_id=? AND label=? "
+                      "AND id!=?", (cell["tray_id"], v, cell_id))
             if dup:
-                raise ApiError("格号「%s」已存在" % v)
+                raise ApiError("字盘内格号「%s」已存在" % v)
         sets.append("%s=?" % f)
         args.append(v)
     if sets:
@@ -365,21 +535,30 @@ def delete_cell(cell_id):
 @transactional
 def bulk_cells(body):
     created, skipped = 0, []
+    default_tray = body.get("tray_id")
     for c in body.get("cells", []):
+        tray_id = int(c.get("tray_id") or default_tray or 0)
+        if not tray_id:
+            t = row("SELECT id FROM trays ORDER BY sort_order, id LIMIT 1")
+            tray_id = t["id"]
+        if not row("SELECT id FROM trays WHERE id=?", (tray_id,)):
+            skipped.append(str(c.get("label") or ""))
+            continue
         label = str(c.get("label") or "").strip()
         if not label:
             continue
-        if row("SELECT id FROM cells WHERE label=?", (label,)):
+        if row("SELECT id FROM cells WHERE tray_id=? AND label=?",
+               (tray_id, label)):
             skipped.append(label)
             continue
         db.execute(
-            "INSERT INTO cells(label,char,font,size,x,y,w,h,qty,capacity) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (label, str(c.get("char") or ""), str(c.get("font") or ""),
-             str(c.get("size") or ""), float(c.get("x") or 0),
-             float(c.get("y") or 0), float(c.get("w") or 46),
-             float(c.get("h") or 46), int(c.get("qty") or 0),
-             int(c.get("capacity") or 50)))
+            "INSERT INTO cells(tray_id,label,char,font,size,x,y,w,h,"
+            "qty,capacity) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (tray_id, label, str(c.get("char") or ""),
+             str(c.get("font") or ""), str(c.get("size") or ""),
+             float(c.get("x") or 0), float(c.get("y") or 0),
+             float(c.get("w") or 46), float(c.get("h") or 46),
+             int(c.get("qty") or 0), int(c.get("capacity") or 50)))
         created += 1
     return {"ok": True, "created": created, "skipped": skipped,
             "state": get_state()}
@@ -393,77 +572,202 @@ def create_session(body):
     items = parse_return_text(text)
     if not items:
         raise ApiError("未解析到任何字符，请检查粘贴内容")
-    cells = rows("SELECT * FROM cells")
-    old = row("SELECT id FROM sessions WHERE status='active'")
+    old = row("SELECT id FROM sessions WHERE status IN ('planning','active')")
     if old:
         raise ApiError("已有进行中的批次（#%d），请先完成或作废" % old["id"])
-    cur = db.execute("INSERT INTO sessions(name, created_at) VALUES(?,?)",
+    cells = rows("SELECT * FROM cells")
+    cur = db.execute("INSERT INTO sessions(name,status,created_at) "
+                     "VALUES(?, 'planning', ?)",
                      (body.get("name") or "归还批次 " + now(), now()))
     sid = cur.lastrowid
-    merged = {}   # cell_id -> 合并后的任务
+    # 先按目标字盘归组：merged[tray_id][cell_id] -> 合并后的任务
+    merged = {}
     new_pending = []
     for ch, qty, font, size, raw in items:
         kind, reason, cell, note = classify(ch, font, size, cells)
         if kind == "task":
-            cid = cell["id"]
-            if cid in merged:
-                merged[cid]["qty"] += qty
+            group = merged.setdefault(cell["tray_id"], {})
+            if cell["id"] in group:
+                group[cell["id"]]["qty"] += qty
             else:
-                merged[cid] = {"cell_id": cid, "char": ch, "font": cell["font"],
-                               "size": cell["size"], "qty": qty,
-                               "x": cell["x"], "y": cell["y"]}
+                group[cell["id"]] = {
+                    "cell_id": cell["id"], "tray_id": cell["tray_id"],
+                    "char": ch, "font": cell["font"], "size": cell["size"],
+                    "qty": qty, "x": cell["x"], "y": cell["y"]}
         else:
             new_pending.append((sid, ch, qty, reason, note, now()))
-    ordered = plan_order(list(merged.values()))
-    by_id = {c["id"]: c for c in cells}
-    for i, t in enumerate(ordered):
-        cell = by_id[t["cell_id"]]
-        note = "预计超容" if cell["qty"] + t["qty"] > cell["capacity"] else ""
-        db.execute(
-            "INSERT INTO tasks(session_id,cell_id,char,font,size,qty,seq,note) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (sid, t["cell_id"], t["char"], t["font"], t["size"], t["qty"],
-             i + 1, note))
+    # 再在每个盘内蛇形规划格位次序
+    tray_order = []
+    for tr in rows("SELECT * FROM trays ORDER BY sort_order, id"):
+        group = merged.get(tr["id"])
+        if not group:
+            continue
+        tray_order.append(tr["id"])
+        by_id = {c["id"]: c for c in cells if c["tray_id"] == tr["id"]}
+        for i, t in enumerate(plan_order(list(group.values()))):
+            cell = by_id[t["cell_id"]]
+            note = "预计超容" if cell["qty"] + t["qty"] > cell["capacity"] \
+                else ""
+            db.execute(
+                "INSERT INTO tasks(session_id,tray_id,cell_id,char,font,size,"
+                "qty,seq,note) VALUES(?,?,?,?,?,?,?,?,?)",
+                (sid, tr["id"], t["cell_id"], t["char"], t["font"],
+                 t["size"], t["qty"], i + 1, note))
+    db.execute("UPDATE sessions SET tray_order=?, start_tray_id=? WHERE id=?",
+               (json.dumps(tray_order),
+                tray_order[0] if tray_order else None, sid))
     for p in new_pending:
         db.execute(
             "INSERT INTO pending_items"
             "(session_id,raw,qty,reason,suggestion,created_at) "
             "VALUES(?,?,?,?,?,?)", p)
-    first = row("SELECT id FROM tasks WHERE session_id=? ORDER BY seq LIMIT 1",
-                (sid,))
-    if first:
-        db.execute("UPDATE tasks SET status='active' WHERE id=?", (first["id"],))
-    else:
-        db.execute("UPDATE sessions SET status='done', finished_at=? "
-                   "WHERE id=?", (now(), sid))
+    if not tray_order:
+        # 全部落入待确认：批次直接停在规划页等待补录
+        pass
     return {"ok": True, "state": get_state()}
 
 
-def _activate_next(session_id):
-    nxt = row("SELECT id FROM tasks WHERE session_id=? AND status='pending' "
-              "ORDER BY seq LIMIT 1", (session_id,))
-    if nxt:
-        db.execute("UPDATE tasks SET status='active' WHERE id=?", (nxt["id"],))
-        return
-    left = row("SELECT COUNT(*) AS n FROM tasks WHERE session_id=? "
-               "AND status IN ('pending','active')", (session_id,))["n"]
-    if left == 0:
-        db.execute("UPDATE sessions SET status='done', finished_at=? "
-                   "WHERE id=?", (now(), session_id))
+@transactional
+def plan_session(session_id, body):
+    """规划页：调整换盘顺序、指定起始盘，并可一次性锁定开始执行。"""
+    sess = row("SELECT * FROM sessions WHERE id=?", (session_id,))
+    if not sess:
+        raise ApiError("批次不存在", 404)
+    if sess["status"] not in ("planning", "active"):
+        raise ApiError("批次已结束，不能调整规划")
+    task_trays = {r["tray_id"] for r in rows(
+        "SELECT DISTINCT tray_id FROM tasks WHERE session_id=?", (session_id,))}
+    if not task_trays:
+        raise ApiError("本批次还没有可执行的格位任务（请先在待确认中归位）")
+    order = body.get("tray_order")
+    if order is not None:
+        if sess["locked"]:
+            raise ApiError("换盘顺序已锁定，不能再调整")
+        if not isinstance(order, list) or not all(isinstance(i, int)
+                                                  for i in order):
+            raise ApiError("换盘顺序格式不正确")
+        if set(order) != task_trays:
+            raise ApiError("换盘顺序必须恰好包含本批次涉及的 %d 个字盘"
+                           % len(task_trays))
+    else:
+        order = [i for i in _loads(sess["tray_order"]) if i in task_trays]
+        order += [t for t in task_trays if t not in order]
+    start = body.get("start_tray_id")
+    if start is not None:
+        start = int(start)
+        if start not in task_trays:
+            raise ApiError("起始盘必须是本批次涉及的字盘")
+        # 起始盘提到首位，其余保持调整后的相对顺序
+        order = [start] + [t for t in order if t != start]
+    lock = bool(body.get("lock"))
+    if lock:
+        if sess["status"] == "active":
+            raise ApiError("批次已开始执行")
+        start_tray = start or sess["start_tray_id"] or order[0]
+        db.execute("UPDATE sessions SET status='active', locked=1, "
+                   "tray_order=?, start_tray_id=?, current_tray_id=? "
+                   "WHERE id=?",
+                   (json.dumps(order), start_tray, start_tray, session_id))
+        # 进入起始盘的换盘闸门：首个格位等扫描字盘码确认后才激活
+    else:
+        db.execute("UPDATE sessions SET tray_order=?, start_tray_id=? "
+                   "WHERE id=?",
+                   (json.dumps(order),
+                        start or sess["start_tray_id"] or order[0],
+                        session_id))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def confirm_tray(session_id, body):
+    """跨盘闸门：扫描实体字盘码，核对预期盘后确认换盘。"""
+    sess = row("SELECT * FROM sessions WHERE id=?", (session_id,))
+    if not sess:
+        raise ApiError("批次不存在", 404)
+    if sess["status"] != "active":
+        raise ApiError("批次未在执行中")
+    expected_id = None
+    t = _current_task(session_id)
+    if t:
+        expected_id = t["tray_id"]
+    else:
+        # 当前盘的格位已做完，按锁定顺序找下一个还有任务的盘
+        order = _loads(sess["tray_order"])
+        remaining = {r["tray_id"] for r in rows(
+            "SELECT DISTINCT tray_id FROM tasks WHERE session_id=? "
+            "AND status='pending'", (session_id,))}
+        for tid in order:
+            if tid in remaining:
+                expected_id = tid
+                break
+    if expected_id is None:
+        raise ApiError("没有等待确认的字盘")
+    expected = get_tray(expected_id)
+    code = str(body.get("scan_code") or "").strip()
+    if not code:
+        raise ApiError("请扫描字盘码")
+    scanned = row("SELECT * FROM trays WHERE scan_code=? AND scan_code!=''",
+                  (code,))
+    if not scanned:
+        return conflict("tray_unknown",
+                        "无法识别的字盘码「%s」，请重新扫描实体字盘" % code,
+                        expected=expected, scanned_code=code,
+                        remaining=_remaining_summary(session_id, expected_id))
+    if scanned["id"] != expected_id:
+        return conflict("tray_mismatch",
+                        "字盘不符：应为「%s」（%s），扫到「%s」（%s）。"
+                        "请暂停核对实物，确认换到正确字盘后再扫"
+                        % (expected["name"], expected["scan_code"] or "未设码",
+                           scanned["name"], scanned["scan_code"]),
+                        expected=expected, scanned=scanned,
+                        remaining=_remaining_summary(session_id, expected_id))
+    db.execute("UPDATE sessions SET current_tray_id=? WHERE id=?",
+               (expected_id, session_id))
+    first = row("SELECT id FROM tasks WHERE session_id=? AND tray_id=? "
+                "AND status='pending' ORDER BY seq LIMIT 1",
+                (session_id, expected_id))
+    if first and not _current_task(session_id):
+        db.execute("UPDATE tasks SET status='active' WHERE id=?",
+                   (first["id"],))
+    return {"ok": True, "state": get_state()}
+
+
+def _remaining_summary(session_id, tray_id):
+    """闸门提示用：下一盘与剩余任务概况。"""
+    order = _loads(row("SELECT tray_order FROM sessions WHERE id=?",
+                       (session_id,))["tray_order"])
+    pending = rows("SELECT tray_id, COUNT(*) AS n, SUM(qty-done_qty) AS q "
+                   "FROM tasks WHERE session_id=? AND status IN "
+                   "('pending','active') GROUP BY tray_id", (session_id,))
+    by = {r["tray_id"]: r for r in pending}
+    trays = {t["id"]: t for t in rows("SELECT * FROM trays")}
+    groups, cur_idx = [], order.index(tray_id) if tray_id in order else -1
+    for i, tid in enumerate(order):
+        if tid not in by:
+            continue
+        groups.append({"tray_id": tid, "name": trays[tid]["name"],
+                       "scan_code": trays[tid]["scan_code"],
+                       "tasks": by[tid]["n"], "qty": by[tid]["q"],
+                       "current": i == cur_idx})
+    nxt = next((g for g in groups if not g["current"]), None)
+    total_tasks = sum(g["tasks"] for g in groups)
+    total_qty = sum(g["qty"] for g in groups)
+    return {"groups": groups, "next_tray": nxt,
+            "total_tasks": total_tasks, "total_qty": total_qty}
 
 
 def _candidates(task, current_cell):
-    """改派候选格：同字符其他格优先，其次空格位，按剩余容量排序。"""
+    """改派候选格：限同一字盘；同字符其他格优先，其次空格位。"""
     out = []
-    for c in rows("SELECT * FROM cells WHERE id != ? ORDER BY "
+    for c in rows("SELECT * FROM cells WHERE id != ? AND tray_id=? ORDER BY "
                   "(char = ?) DESC, (capacity - qty) DESC, label",
-                  (current_cell["id"], task["char"])):
+                  (current_cell["id"], task["tray_id"], task["char"])):
         if c["char"] not in (task["char"], ""):
             continue
         out.append({"id": c["id"], "label": c["label"], "char": c["char"],
                     "font": c["font"], "size": c["size"], "x": c["x"],
                     "y": c["y"], "qty": c["qty"], "capacity": c["capacity"],
-                    "free": c["capacity"] - c["qty"]})
+                    "tray_id": c["tray_id"], "free": c["capacity"] - c["qty"]})
         if len(out) >= 8:
             break
     return out
@@ -478,7 +782,7 @@ def confirm_task(task_id, body):
         raise ApiError("任务不存在", 404)
     sess = row("SELECT * FROM sessions WHERE id=?", (t["session_id"],))
     if not sess or sess["status"] != "active":
-        raise ApiError("批次已结束，不能确认")
+        raise ApiError("批次未在执行中，不能确认")
     if t["status"] == "done":
         return conflict("duplicate", "该任务已完成，请勿重复确认", task=t)
     if t["status"] != "active":
@@ -486,20 +790,35 @@ def confirm_task(task_id, body):
     cell = row("SELECT * FROM cells WHERE id=?", (t["cell_id"],))
     if not cell:
         raise ApiError("任务没有目标格位")
-    if label and label.upper() != cell["label"].upper():
-        scanned = row("SELECT * FROM cells WHERE upper(label)=?",
-                      (label.upper(),))
+    if label:
+        # 只认当前字盘内的格号：扫到别的盘的格也视为实物不符
+        scanned = row("SELECT c.*, tr.name AS tray_name FROM cells c "
+                      "JOIN trays tr ON tr.id=c.tray_id "
+                      "WHERE c.tray_id=? AND upper(c.label)=?",
+                      (t["tray_id"], label.upper()))
         if not scanned:
+            same_label = row("SELECT c.*, tr.name AS tray_name FROM cells c "
+                             "JOIN trays tr ON tr.id=c.tray_id "
+                             "WHERE upper(c.label)=?", (label.upper(),))
+            if same_label:
+                cur_tray = get_tray(t["tray_id"])
+                return conflict("wrong_tray",
+                                "扫到的格号「%s」属于字盘「%s」，"
+                                "当前应在「%s」上操作"
+                                % (same_label["label"],
+                                   same_label["tray_name"], cur_tray["name"]),
+                                label=label, other_tray=same_label["tray_name"])
             return conflict("unknown_label",
-                            "无法识别的格号「%s」" % label, label=label)
-        dup = row("SELECT COUNT(*) AS n FROM tasks WHERE session_id=? "
-                  "AND cell_id=? AND status='done'",
-                  (t["session_id"], scanned["id"]))["n"]
-        return conflict("mismatch",
-                        "实物不符：扫描到「%s」，当前应为「%s」"
-                        % (scanned["label"], cell["label"]),
-                        scanned=scanned, expected=cell,
-                        duplicate_of=bool(dup))
+                            "当前字盘无法识别的格号「%s」" % label, label=label)
+        if scanned["id"] != cell["id"]:
+            dup = row("SELECT COUNT(*) AS n FROM tasks WHERE session_id=? "
+                      "AND cell_id=? AND status='done'",
+                      (t["session_id"], scanned["id"]))["n"]
+            return conflict("mismatch",
+                            "实物不符：扫描到「%s」，当前应为「%s」"
+                            % (scanned["label"], cell["label"]),
+                            scanned=scanned, expected=cell,
+                            duplicate_of=bool(dup))
     remain = t["qty"] - t["done_qty"]
     qty = body.get("qty")
     try:
@@ -522,9 +841,10 @@ def confirm_task(task_id, body):
                "payload,created_at) VALUES(?,?,?,?,?,?,?)",
                (t["session_id"], task_id, cell["id"], "confirm", n,
                 json.dumps({"qty": n, "cell_id": cell["id"],
-                            "task_id": task_id}), now()))
+                            "tray_id": t["tray_id"], "task_id": task_id}),
+                now()))
     if st == "done":
-        _activate_next(t["session_id"])
+        _advance(t["session_id"])
     return {"ok": True, "state": get_state()}
 
 
@@ -542,6 +862,9 @@ def reassign_task(task_id, body):
         raise ApiError("目标格位不存在")
     if old and new["id"] == old["id"]:
         raise ApiError("目标与原格位相同")
+    # 换盘导航下不允许跨字盘改派：跨盘必须走换盘闸门
+    if new["tray_id"] != t["tray_id"]:
+        raise ApiError("不能跨字盘改派；目标在另一个字盘上，请按换盘顺序操作")
     # 空格位首次接收铅字：同步登记字种（字符/字体/字号），便于之后再匹配
     synced = False
     if new["char"] == "" and t["char"]:
@@ -574,7 +897,7 @@ def skip_task(task_id):
     if t["status"] != "active":
         raise ApiError("只能跳过当前任务")
     db.execute("UPDATE tasks SET status='skipped' WHERE id=?", (task_id,))
-    _activate_next(t["session_id"])
+    _advance(t["session_id"])
     return {"ok": True, "state": get_state()}
 
 
@@ -586,7 +909,7 @@ def undo(session_id):
     if sess["status"] == "abandoned":
         raise ApiError("批次已作废，不能撤销")
     if sess["status"] == "done" and row(
-            "SELECT id FROM sessions WHERE status='active'"):
+            "SELECT id FROM sessions WHERE status IN ('planning','active')"):
         raise ApiError("已有进行中的批次，请先完成或作废后再撤销上一批次")
     act = row("SELECT * FROM actions WHERE session_id=? AND kind='confirm' "
               "ORDER BY id DESC LIMIT 1", (session_id,))
@@ -599,10 +922,12 @@ def undo(session_id):
     if t:
         db.execute("UPDATE tasks SET done_qty=max(done_qty-?,0), "
                    "status='active' WHERE id=?", (p["qty"], t["id"]))
+        # 撤销后该任务成为唯一当前任务（即使此前已推进到换盘闸门）
         db.execute("UPDATE tasks SET status='pending' WHERE session_id=? "
                    "AND status='active' AND id!=?", (session_id, t["id"]))
-    db.execute("UPDATE sessions SET status='active', finished_at=NULL "
-               "WHERE id=?", (session_id,))
+        db.execute("UPDATE sessions SET status='active', current_tray_id=?, "
+                   "finished_at=NULL WHERE id=?",
+                   (t["tray_id"], session_id))
     db.execute("INSERT INTO actions(session_id,task_id,cell_id,kind,delta,"
                "payload,created_at) VALUES(?,?,?,?,?,?,?)",
                (session_id, p["task_id"], p["cell_id"], "undo", -p["qty"],
@@ -617,7 +942,7 @@ def finish_session(session_id):
     if not sess:
         raise ApiError("批次不存在", 404)
     if sess["status"] != "active":
-        raise ApiError("批次已结束")
+        raise ApiError("批次未在执行中")
     left = row("SELECT COUNT(*) AS n FROM tasks WHERE session_id=? "
                "AND status IN ('pending','active')", (session_id,))["n"]
     if left:
@@ -657,41 +982,58 @@ def resolve_pending(pid, body):
         raise ApiError("请选择目标格位")
     db.execute("UPDATE pending_items SET status='resolved', "
                "resolved_cell_id=? WHERE id=?", (cell["id"], pid))
-    sess = row("SELECT * FROM sessions WHERE status='active' "
+    sess = row("SELECT * FROM sessions WHERE status IN ('planning','active') "
                "ORDER BY id DESC LIMIT 1")
+    created = False
     if not sess:
-        cur = db.execute("INSERT INTO sessions(name, created_at) VALUES(?,?)",
-                         ("待确认补录 " + now(), now()))
+        cur = db.execute(
+            "INSERT INTO sessions(name,status,created_at) "
+            "VALUES(?, 'planning', ?)",
+            ("待确认补录 " + now(), now()))
         sess = row("SELECT * FROM sessions WHERE id=?", (cur.lastrowid,))
-    maxseq = row("SELECT COALESCE(MAX(seq),0) AS m FROM tasks "
-                 "WHERE session_id=?", (sess["id"],))["m"]
+        created = True
+    # 盘内序号：追加到该盘已有任务之后
+    mx = row("SELECT COALESCE(MAX(seq),0) AS m FROM tasks "
+             "WHERE session_id=? AND tray_id=?",
+             (sess["id"], cell["tray_id"]))["m"]
     cur = db.execute(
-        "INSERT INTO tasks(session_id,cell_id,char,font,size,qty,seq,note) "
-        "VALUES(?,?,?,?,?,?,?,?)",
-        (sess["id"], cell["id"], item["raw"], cell["font"], cell["size"],
-         item["qty"], maxseq + 1, "待确认补录"))
-    if not row("SELECT id FROM tasks WHERE session_id=? AND status='active'",
-               (sess["id"],)):
-        db.execute("UPDATE tasks SET status='active' WHERE id=?",
-                   (cur.lastrowid,))
-        db.execute("UPDATE sessions SET status='active', finished_at=NULL "
-                   "WHERE id=?", (sess["id"],))
+        "INSERT INTO tasks(session_id,tray_id,cell_id,char,font,size,qty,seq,"
+        "note) VALUES(?,?,?,?,?,?,?,?,?)",
+        (sess["id"], cell["tray_id"], cell["id"], item["raw"], cell["font"],
+         cell["size"], item["qty"], mx + 1, "待确认补录"))
     db.execute("INSERT INTO actions(session_id,task_id,cell_id,kind,delta,"
                "payload,created_at) VALUES(?,?,?,?,?,?,?)",
                (sess["id"], cur.lastrowid, cell["id"], "resolve", 0,
                 json.dumps({"pending_id": pid, "raw": item["raw"]},
                            ensure_ascii=False), now()))
+    # 更新换盘归组
+    order = [i for i in _loads(sess["tray_order"]) if isinstance(i, int)]
+    if cell["tray_id"] not in order:
+        order.append(cell["tray_id"])
+    start = sess["start_tray_id"] or order[0]
+    if sess["status"] == "planning":
+        db.execute("UPDATE sessions SET tray_order=?, start_tray_id=? "
+                   "WHERE id=?", (json.dumps(order), start, sess["id"]))
+    else:
+        # 执行中补录：若是全新字盘，追加到锁定顺序末尾
+        db.execute("UPDATE sessions SET tray_order=? WHERE id=?",
+                   (json.dumps(order), sess["id"]))
+        act = _current_task(sess["id"])
+        if not act:
+            # 当前盘已做完又补进别的盘：保持闸门等待扫描，不自动激活
+            pass
     return {"ok": True, "state": get_state()}
 
 # ---------------------------------------------------------------- 备份恢复
 
-TABLES = ["cells", "sessions", "tasks", "pending_items", "actions"]
-DELETE_ORDER = ["actions", "pending_items", "tasks", "sessions", "cells"]
+TABLES = ["trays", "cells", "sessions", "tasks", "pending_items", "actions"]
+DELETE_ORDER = ["actions", "pending_items", "tasks", "sessions", "cells",
+                "trays"]
 
 
 def backup():
     with DB_LOCK:
-        return {"app": "sortify", "version": 1, "exported_at": now(),
+        return {"app": "sortify", "version": 2, "exported_at": now(),
                 "tables": {t: rows("SELECT * FROM %s" % t) for t in TABLES}}
 
 
@@ -700,17 +1042,61 @@ def restore(data):
     if not isinstance(data, dict) or data.get("app") != "sortify" \
             or not isinstance(data.get("tables"), dict):
         raise ApiError("备份文件格式不正确")
+    ver = int(data.get("version") or 1)
     for t in DELETE_ORDER:
         db.execute("DELETE FROM %s" % t)
-    for t in TABLES:
-        for r in data["tables"].get(t, []):
-            if not isinstance(r, dict) or not r:
-                continue
-            cols = ",".join(r.keys())
-            qs = ",".join("?" * len(r))
-            db.execute("INSERT INTO %s(%s) VALUES(%s)" % (t, cols, qs),
-                       list(r.values()))
+    tables = data["tables"]
+    if ver < 2 or "trays" not in tables or not tables.get("trays"):
+        # v1 备份：全部格位归入「默认字盘」，保留归属
+        cur = db.execute(
+            "INSERT INTO trays(id,name,scan_code,sort_order,created_at) "
+            "VALUES(1,?,?,0,?)", ("默认字盘", "", now()))
+        for r in tables.get("cells", []):
+            r = dict(r)
+            r.pop("tray_id", None)
+            r["tray_id"] = 1
+            _insert("cells", r)
+        for r in tables.get("sessions", []):
+            r = dict(r)
+            r.setdefault("status", "done")
+            r.setdefault("tray_order", "[1]")
+            r.setdefault("start_tray_id", 1)
+            r.setdefault("locked", 1 if r.get("status") == "active" else 0)
+            r.setdefault("current_tray_id", 1)
+            _insert("sessions", r)
+        for t in ("tasks", "pending_items", "actions"):
+            for r in tables.get(t, []):
+                r = dict(r)
+                if t == "tasks":
+                    r["tray_id"] = r.get("tray_id") or 1
+                _insert(t, r)
+        # 显式指定 id 后刷新自增序列，避免后续主键冲突
+        for t in ("trays", "cells", "sessions", "tasks", "pending_items",
+                  "actions"):
+            mx = db.execute("SELECT COALESCE(MAX(id),0) AS m FROM %s" % t) \
+                .fetchone()["m"]
+            db.execute(
+                "INSERT OR REPLACE INTO sqlite_sequence(name,seq) VALUES(?,?)",
+                (t, mx))
+    else:
+        for t in TABLES:
+            for r in tables.get(t, []):
+                if isinstance(r, dict) and r:
+                    _insert(t, r)
+        for t in TABLES:
+            mx = db.execute("SELECT COALESCE(MAX(id),0) AS m FROM %s" % t) \
+                .fetchone()["m"]
+            db.execute(
+                "INSERT OR REPLACE INTO sqlite_sequence(name,seq) VALUES(?,?)",
+                (t, mx))
     return {"ok": True, "state": get_state()}
+
+
+def _insert(table, r):
+    cols = ",".join(r.keys())
+    qs = ",".join("?" * len(r))
+    db.execute("INSERT INTO %s(%s) VALUES(%s)" % (table, cols, qs),
+               list(r.values()))
 
 # ---------------------------------------------------------------- 种子数据
 
@@ -720,32 +1106,97 @@ SEED_PUNCT = "，。、「」"
 
 
 def seed():
-    """首次启动时生成示例字盘：6 行常用字 + 1 行标点与空格位。"""
+    """首次启动时生成默认字盘：6 行常用字 + 1 行标点与空格位。"""
+    cur = db.execute(
+        "INSERT INTO trays(name,scan_code,sort_order,created_at) "
+        "VALUES(?,?,0,?)", ("默认字盘", "TRAY-01", now()))
+    tid = cur.lastrowid
     for i, ch in enumerate(SEED_CHARS):
         r, c = divmod(i, 8)
         db.execute(
-            "INSERT INTO cells(label,char,font,size,x,y,w,h,qty,capacity) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-            ("%s%d" % (chr(65 + r), c + 1), ch, "宋体", "五号",
+            "INSERT INTO cells(tray_id,label,char,font,size,x,y,w,h,"
+            "qty,capacity) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (tid, "%s%d" % (chr(65 + r), c + 1), ch, "宋体", "五号",
              20 + c * 54, 20 + r * 54, 46, 46, 20 + (i * 7) % 25, 50))
     for j, ch in enumerate(SEED_PUNCT):
         db.execute(
-            "INSERT INTO cells(label,char,font,size,x,y,w,h,qty,capacity) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-            ("G%d" % (j + 1), ch, "宋体", "五号",
+            "INSERT INTO cells(tray_id,label,char,font,size,x,y,w,h,"
+            "qty,capacity) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (tid, "G%d" % (j + 1), ch, "宋体", "五号",
              20 + j * 54, 20 + 6 * 54, 46, 46, 20, 50))
     for j in range(2):  # 空格位，供改派使用
         db.execute(
-            "INSERT INTO cells(label,char,font,size,x,y,w,h,qty,capacity) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
-            ("G%d" % (len(SEED_PUNCT) + j + 1), "", "", "",
+            "INSERT INTO cells(tray_id,label,char,font,size,x,y,w,h,"
+            "qty,capacity) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (tid, "G%d" % (len(SEED_PUNCT) + j + 1), "", "", "",
              20 + (len(SEED_PUNCT) + j) * 54, 20 + 6 * 54, 46, 46, 0, 50))
+
+
+def _migrate():
+    """把旧版（单字盘）数据库升级到多字盘结构，原有格位归入默认字盘。"""
+    cols = {r["name"] for r in db.execute("PRAGMA table_info(cells)")}
+    if "tray_id" in cols:
+        return
+    # 重建 cells（旧表 label 为全局 UNIQUE，需去掉并改为盘内唯一索引）
+    db.execute("PRAGMA legacy_alter_table=ON")
+    db.execute("ALTER TABLE cells RENAME TO cells_old")
+    db.executescript("""
+    CREATE TABLE cells (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      tray_id   INTEGER NOT NULL REFERENCES trays(id),
+      label     TEXT NOT NULL,
+      char      TEXT NOT NULL DEFAULT '',
+      font      TEXT NOT NULL DEFAULT '',
+      size      TEXT NOT NULL DEFAULT '',
+      x REAL NOT NULL DEFAULT 0, y REAL NOT NULL DEFAULT 0,
+      w REAL NOT NULL DEFAULT 46, h REAL NOT NULL DEFAULT 46,
+      qty INTEGER NOT NULL DEFAULT 0,
+      capacity INTEGER NOT NULL DEFAULT 50
+    );
+    CREATE UNIQUE INDEX idx_cells_tray_label ON cells(tray_id, label);
+    """)
+    cur = db.execute(
+        "INSERT INTO trays(name,scan_code,sort_order,created_at) "
+        "VALUES(?,?,0,?)", ("默认字盘", "TRAY-01", now()))
+    tid = cur.lastrowid
+    db.execute(
+        "INSERT INTO cells(id,tray_id,label,char,font,size,x,y,w,h,qty,"
+        "capacity) SELECT id,?,label,char,font,size,x,y,w,h,qty,capacity "
+        "FROM cells_old ORDER BY id", (tid,))
+    db.execute("UPDATE cells SET label=('格'||id) WHERE label IS NULL OR label=''")
+    db.execute("DROP TABLE cells_old")
+    db.execute("PRAGMA legacy_alter_table=OFF")
+    db.execute("INSERT OR REPLACE INTO sqlite_sequence(name,seq) "
+               "SELECT 'cells', MAX(id) FROM cells")
+
+    scols = {r["name"] for r in db.execute("PRAGMA table_info(sessions)")}
+    for ddl in (
+        "ALTER TABLE sessions ADD COLUMN tray_order TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE sessions ADD COLUMN start_tray_id INTEGER",
+        "ALTER TABLE sessions ADD COLUMN locked INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN current_tray_id INTEGER",
+    ):
+        col = ddl.split("ADD COLUMN")[1].split()[0]
+        if col not in scols:
+            db.execute(ddl)
+    db.execute("ALTER TABLE tasks ADD COLUMN tray_id INTEGER")
+    db.execute("UPDATE tasks SET tray_id=? WHERE tray_id IS NULL", (tid,))
+    # 旧批次：仍在进行的升级为已锁定、当前盘=默认盘；历史批次同样补归属
+    db.execute("UPDATE sessions SET tray_order=?, start_tray_id=?, "
+               "current_tray_id=? WHERE tray_order='[]' OR tray_order IS NULL",
+               (json.dumps([tid]), tid, tid))
+    db.execute("UPDATE sessions SET locked=1 WHERE status='active' "
+               "AND locked=0")
 
 
 def init_db():
     with DB_LOCK:
         db.executescript(SCHEMA)
-        if not row("SELECT id FROM cells LIMIT 1"):
+        _migrate()
+        # 盘内格号唯一索引：旧库在迁移加列之后才能创建
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cells_tray_label "
+                   "ON cells(tray_id, label)")
+        if not row("SELECT id FROM trays LIMIT 1"):
             seed()
         db.commit()
 
@@ -759,6 +1210,24 @@ def handle_api(method, path, body):
         return backup()
     if method == "POST" and path == "/api/restore":
         return restore(body)
+
+    # ---- 字盘 ----
+    if method == "POST" and path == "/api/trays":
+        return create_tray(body)
+    if method == "POST" and path == "/api/trays/reorder":
+        return reorder_trays(body)
+    m = re.fullmatch(r"/api/trays/(\d+)", path)
+    if m:
+        tid = int(m.group(1))
+        if method == "PUT":
+            return update_tray(tid, body)
+        if method == "DELETE":
+            return delete_tray(tid)
+    m = re.fullmatch(r"/api/trays/(\d+)/duplicate", path)
+    if m and method == "POST":
+        return duplicate_tray(int(m.group(1)), body)
+
+    # ---- 格位 ----
     if method == "POST" and path == "/api/cells":
         return create_cell(body)
     if method == "POST" and path == "/api/cells/bulk":
@@ -770,8 +1239,16 @@ def handle_api(method, path, body):
             return update_cell(cid, body)
         if method == "DELETE":
             return delete_cell(cid)
+
+    # ---- 批次 ----
     if method == "POST" and path == "/api/sessions":
         return create_session(body)
+    m = re.fullmatch(r"/api/sessions/(\d+)/plan", path)
+    if m and method == "POST":
+        return plan_session(int(m.group(1)), body)
+    m = re.fullmatch(r"/api/sessions/(\d+)/confirm-tray", path)
+    if m and method == "POST":
+        return confirm_tray(int(m.group(1)), body)
     m = re.fullmatch(r"/api/sessions/(\d+)/(finish|abandon|undo)", path)
     if m and method == "POST":
         sid, action = int(m.group(1)), m.group(2)
@@ -801,7 +1278,7 @@ MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Sortify/1.0"
+    server_version = "Sortify/2.0"
 
     def log_message(self, fmt, *args):
         pass
