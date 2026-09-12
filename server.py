@@ -19,6 +19,7 @@ import os
 import re
 import sqlite3
 import threading
+import unicodedata
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -175,6 +176,54 @@ CREATE TABLE IF NOT EXISTS postings (
   after_qty INTEGER NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS requisitions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'planning', -- planning / active / done / cancelled
+  include_spaces INTEGER NOT NULL DEFAULT 0,
+  include_punct INTEGER NOT NULL DEFAULT 1,
+  input_mode TEXT NOT NULL DEFAULT 'text', -- text / list
+  source_text TEXT NOT NULL DEFAULT '',
+  tray_order TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  finished_at TEXT,
+  cancelled_at TEXT,
+  returned_session_id INTEGER              -- 一键带入归还流程后生成的归还批次
+);
+CREATE TABLE IF NOT EXISTS req_demands (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  req_id INTEGER NOT NULL REFERENCES requisitions(id),
+  char TEXT NOT NULL,
+  font TEXT NOT NULL DEFAULT '',
+  size TEXT NOT NULL DEFAULT '',
+  qty INTEGER NOT NULL,                   -- 汇总后的总需求
+  issue TEXT NOT NULL DEFAULT '',         -- '' / short / variant / spec / none
+  issue_text TEXT NOT NULL DEFAULT '',
+  seq INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS req_allocations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  req_id INTEGER NOT NULL REFERENCES requisitions(id),
+  demand_id INTEGER NOT NULL REFERENCES req_demands(id),
+  tray_id INTEGER NOT NULL REFERENCES trays(id),
+  cell_id INTEGER NOT NULL REFERENCES cells(id),
+  qty INTEGER NOT NULL,                   -- 锁定时在该格的预留 / 应取数量
+  taken_qty INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'reserved', -- reserved / active / done / gap / cancelled
+  seq INTEGER NOT NULL DEFAULT 0,         -- 盘内路线次序
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS req_issues (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  req_id INTEGER NOT NULL REFERENCES requisitions(id),
+  allocation_id INTEGER,                  -- 来源格操作（pick/change/gap）时的分配
+  kind TEXT NOT NULL,                     -- pick / gap / change
+  cell_id INTEGER,
+  tray_id INTEGER,
+  qty INTEGER NOT NULL DEFAULT 0,
+  payload TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
 """
 
 # ---------------------------------------------------------------- 字表
@@ -211,6 +260,13 @@ DISC_KIND_NAMES = {"short": "短缺", "surplus": "溢出", "review": "待复核"
 
 # 盘点进行中（锁住归还确认与存量编辑）的状态
 ST_ACTIVE = ("counting", "reviewing")
+
+# 领用相关名称
+REQ_STATUS_NAMES = {"planning": "待锁定", "active": "执行中",
+                    "done": "已完成", "cancelled": "已取消"}
+ALLOC_STATUS_NAMES = {"reserved": "已预留", "active": "当前格",
+                      "done": "已取", "gap": "缺口", "cancelled": "已取消"}
+REQ_ISSUE_NAMES = {"pick": "实取", "gap": "保留缺口", "change": "改选来源格"}
 
 
 class ApiError(Exception):
@@ -404,6 +460,13 @@ def get_state():
         history = [_stock_brief(s) for s in rows(
             "SELECT * FROM stocktakes WHERE status IN ('posted','cancelled') "
             "ORDER BY id DESC LIMIT 10")]
+        # 配字领用：最近一张进行中的领用单全量载入；另附最近历史概要
+        req_row = row("SELECT * FROM requisitions WHERE status IN "
+                      "('planning','active') ORDER BY id DESC LIMIT 1")
+        requisition = _load_requisition(req_row) if req_row else None
+        req_history = [_req_brief(x) for x in rows(
+            "SELECT * FROM requisitions WHERE status IN ('done','cancelled') "
+            "ORDER BY id DESC LIMIT 10")]
         return {"trays": trays, "cells": cells, "session": session,
                 "last_done": last_done, "pending": pending,
                 "conflicts": capacity_conflicts(cells, session),
@@ -412,7 +475,11 @@ def get_state():
                 "stock_status_names": STOCK_STATUS_NAMES,
                 "count_status_names": COUNT_STATUS_NAMES,
                 "review_names": REVIEW_NAMES,
-                "disc_kind_names": DISC_KIND_NAMES}
+                "disc_kind_names": DISC_KIND_NAMES,
+                "requisition": requisition, "req_history": req_history,
+                "req_status_names": REQ_STATUS_NAMES,
+                "alloc_status_names": ALLOC_STATUS_NAMES,
+                "req_issue_names": REQ_ISSUE_NAMES}
 
 
 def conflict(ctype, message, **kw):
@@ -618,6 +685,9 @@ def delete_tray(tray_id):
     if row("SELECT COUNT(*) AS n FROM tasks WHERE tray_id=?",
            (tray_id,))["n"]:
         raise ApiError("字盘「%s」已有归还任务记录，不能删除" % t["name"])
+    if row("SELECT COUNT(*) AS n FROM req_allocations WHERE tray_id=?",
+           (tray_id,))["n"]:
+        raise ApiError("字盘「%s」已有领用单记录，不能删除" % t["name"])
     db.execute("DELETE FROM trays WHERE id=?", (tray_id,))
     return {"ok": True, "state": get_state()}
 
@@ -740,6 +810,10 @@ def delete_cell(cell_id):
     used = row("SELECT COUNT(*) AS n FROM tasks WHERE cell_id=?", (cell_id,))
     if used["n"]:
         raise ApiError("该格已有归还任务记录，不能删除")
+    used = row("SELECT COUNT(*) AS n FROM req_allocations WHERE cell_id=?",
+               (cell_id,))
+    if used["n"]:
+        raise ApiError("该格已有领用单记录，不能删除")
     db.execute("UPDATE pending_items SET resolved_cell_id=NULL "
                "WHERE resolved_cell_id=?", (cell_id,))
     db.execute("DELETE FROM cells WHERE id=?", (cell_id,))
@@ -1247,6 +1321,797 @@ def resolve_pending(pid, body):
             # 当前盘已做完又补进别的盘：保持闸门等待扫描，不自动激活
             pass
     return {"ok": True, "state": get_state()}
+
+# ---------------------------------------------------------------- 配字领用 API
+
+
+def _is_space_char(ch):
+    return len(ch) == 1 and unicodedata.category(ch) == "Zs"
+
+
+def _is_punct_char(ch):
+    return len(ch) == 1 and unicodedata.category(ch).startswith("P")
+
+
+def parse_requisition_text(text, mode):
+    """解析配字领用输入。
+
+    mode='text'：整段待排文字，逐字符计数（无字体字号，换行等控制符一律不计）；
+    mode='list'：每行「字符、数量、字体、字号」，沿用归还清单写法。
+    返回 [(char, qty, font, size, raw), ...]
+    """
+    if mode == "text":
+        return [(ch, 1, "", "", ch) for ch in (text or "")
+                if unicodedata.category(ch) != "Cc"]
+    return parse_return_text(text)
+
+
+def _filter_req_items(items, include_spaces, include_punct):
+    kept, n_space, n_punct = [], 0, 0
+    for ch, qty, font, size, raw in items:
+        if _is_space_char(ch):
+            if include_spaces:
+                kept.append((ch, qty, font, size, raw))
+            else:
+                n_space += qty
+            continue
+        if _is_punct_char(ch):
+            if include_punct:
+                kept.append((ch, qty, font, size, raw))
+            else:
+                n_punct += qty
+            continue
+        kept.append((ch, qty, font, size, raw))
+    return kept, n_space, n_punct
+
+
+def _aggregate_req(items):
+    """按 字符+字体+字号 汇总需求，保留首次出现顺序。"""
+    total, order = {}, []
+    for ch, qty, font, size, raw in items:
+        key = (ch, font, size)
+        if key not in total:
+            total[key] = 0
+            order.append(key)
+        total[key] += qty
+    return [(ch, font, size, total[(ch, font, size)])
+            for ch, font, size in order]
+
+
+def _hold_map(exclude_req_id=None):
+    """各格当前被未完成领用单预留（尚未实取）的数量。
+
+    只计 reserved / active：gap（缺口）与 cancelled 不占库存，
+    done 部分通过 taken_qty 已经实取扣过库存。
+    """
+    sql = ("SELECT cell_id, COALESCE(SUM(qty-taken_qty),0) AS held "
+           "FROM req_allocations a JOIN requisitions r ON r.id=a.req_id "
+           "WHERE r.status IN ('planning','active') "
+           "AND a.status IN ('reserved','active') ")
+    args = []
+    if exclude_req_id is not None:
+        sql += "AND a.req_id!=? "
+        args.append(exclude_req_id)
+    sql += "GROUP BY cell_id"
+    return {r["cell_id"]: r["held"] for r in rows(sql, tuple(args))}
+
+
+def _allocatable(cell, held):
+    return max(0, cell["qty"] - held.get(cell["id"], 0))
+
+
+def _held_on_cell(cell_id, exclude_req_id=None, exclude_alloc_ids=()):
+    """某格被未完成领用单预留的数量，可排除指定领用单 / 指定分配行。"""
+    sql = ("SELECT COALESCE(SUM(qty-taken_qty),0) AS n FROM req_allocations a "
+           "JOIN requisitions r ON r.id=a.req_id "
+           "WHERE a.cell_id=? AND r.status IN ('planning','active') "
+           "AND a.status IN ('reserved','active') ")
+    args = [cell_id]
+    if exclude_req_id is not None:
+        sql += "AND a.req_id!=? "
+        args.append(exclude_req_id)
+    if exclude_alloc_ids:
+        ph = ",".join("?" * len(exclude_alloc_ids))
+        sql += "AND a.id NOT IN (%s) " % ph
+        args.extend(exclude_alloc_ids)
+    return row(sql, tuple(args))["n"]
+
+
+def _cell_avail(cell_id, exclude_req_id=None, exclude_alloc_ids=()):
+    c = row("SELECT qty FROM cells WHERE id=?", (cell_id,))
+    if not c:
+        return 0
+    return max(0, c["qty"] - _held_on_cell(
+        cell_id, exclude_req_id, exclude_alloc_ids))
+
+
+def _shortage_issue(ch, font, size, cells, remain):
+    """没有任何可配格位时区分：仅有异体字 / 规格不符 / 无格位。不自动替换。"""
+    same = [c for c in cells if c["char"] == ch]
+    if same:
+        specs = sorted({"%s / %s" % (c["font"] or "—", c["size"] or "—")
+                        for c in same})
+        return ("spec",
+                "规格不符：需求 %s / %s，字盘中仅有 %s"
+                % (font or "任意字体", size or "任意字号", "、".join(specs)))
+    var = VARIANTS.get(ch)
+    if var and any(c["char"] == var for c in cells):
+        return ("variant", "仅有异体字：字盘中有正字「%s」的格位，不自动替换" % var)
+    return ("short", "字盘中无「%s」的格位，缺 %d 枚" % (ch, remain))
+
+
+def _plan_req_allocation(cells, trays, demands, exclude_req_id):
+    """从多字盘同规格格位贪心分配可用铅字，扣除其他未完成领用单的预留。
+
+    demands: [(seq, char, font, size, qty), ...]
+    返回 (alloc_rows, issues)：alloc_rows=[(demand_seq, tray_id, cell_id, qty)]
+    """
+    held = _hold_map(exclude_req_id)
+    rank = {t["id"]: i for i, t in enumerate(trays)}
+    alloc_rows, issues = [], {}
+    for seq, ch, font, size, need in demands:
+        exact = [c for c in cells if c["char"] == ch
+                 and (not font or c["font"] == font)
+                 and (not size or c["size"] == size)]
+        exact.sort(key=lambda c: (-_allocatable(c, held),
+                                  rank.get(c["tray_id"], 1 << 30),
+                                  c["y"], c["x"]))
+        remain = need
+        for c in exact:
+            avail = _allocatable(c, held)
+            if avail <= 0 or remain <= 0:
+                break
+            n = min(avail, remain)
+            alloc_rows.append((seq, c["tray_id"], c["id"], n))
+            held[c["id"]] = held.get(c["id"], 0) + n
+            remain -= n
+        if remain > 0:
+            if exact:
+                issues[seq] = ("short",
+                               "数量不足：需求 %d 枚，已配 %d 枚，缺口 %d 枚"
+                               % (need, need - remain, remain))
+            else:
+                issues[seq] = _shortage_issue(ch, font, size, cells, remain)
+    return alloc_rows, issues
+
+
+@transactional
+def create_requisition(body):
+    text = body.get("text") or ""
+    mode = "list" if str(body.get("mode") or "") == "list" else "text"
+    inc_spaces = bool(body.get("include_spaces"))
+    inc_punct = bool(body.get("include_punct", True))
+    items = parse_requisition_text(text, mode)
+    items, d_space, d_punct = _filter_req_items(items, inc_spaces, inc_punct)
+    if not items:
+        raise ApiError("未解析到任何需要领用的字符（可能全部为空格 / 标点，已被排除）")
+    agg = _aggregate_req(items)
+    cells = rows("SELECT * FROM cells")
+    trays = rows("SELECT * FROM trays ORDER BY sort_order, id")
+    cur = db.execute(
+        "INSERT INTO requisitions(name,status,include_spaces,include_punct,"
+        "input_mode,source_text,created_at) VALUES(?, 'planning',?,?,?,?,?)",
+        (str(body.get("name") or "").strip() or ("领用单 " + now()),
+         int(inc_spaces), int(inc_punct), mode, text, now()))
+    rid = cur.lastrowid
+    demands = [(i + 1, ch, font, size, qty)
+               for i, (ch, font, size, qty) in enumerate(agg)]
+    alloc_rows, issues = _plan_req_allocation(cells, trays, demands, rid)
+    for seq, ch, font, size, qty in demands:
+        issue, itext = issues.get(seq, ("", ""))
+        db.execute(
+            "INSERT INTO req_demands(req_id,char,font,size,qty,issue,issue_text,"
+            "seq) VALUES(?,?,?,?,?,?,?,?)",
+            (rid, ch, font, size, qty, issue, itext, seq))
+    demand_id = {r["seq"]: r["id"] for r in rows(
+        "SELECT id, seq FROM req_demands WHERE req_id=?", (rid,))}
+    # 盘内路线：按字盘归组后蛇形排序，盘内序号各自从 1 起
+    cells_by_id = {c["id"]: c for c in cells}
+    groups = {}
+    for dseq, tid, cid, qty in alloc_rows:
+        groups.setdefault(tid, []).append((dseq, cid, qty))
+    involved = [t["id"] for t in trays if t["id"] in groups]
+    ts = now()
+    for tid in involved:
+        ordered = plan_order([
+            {"x": cells_by_id[cid]["x"], "y": cells_by_id[cid]["y"],
+             "dseq": dseq, "cid": cid, "qty": qty}
+            for dseq, cid, qty in groups[tid]])
+        for i, it in enumerate(ordered):
+            db.execute(
+                "INSERT INTO req_allocations(req_id,demand_id,tray_id,cell_id,"
+                "qty,status,seq,created_at) VALUES(?,?,?,?,?, 'reserved', ?,?)",
+                (rid, demand_id[it["dseq"]], tid, it["cid"], it["qty"],
+                 i + 1, ts))
+    db.execute("UPDATE requisitions SET tray_order=? WHERE id=?",
+               (json.dumps(involved), rid))
+    return {"ok": True, "requisition_id": rid,
+            "dropped_spaces": d_space, "dropped_punct": d_punct,
+            "state": get_state()}
+
+
+def _get_req(rid):
+    r = row("SELECT * FROM requisitions WHERE id=?", (rid,))
+    if not r:
+        raise ApiError("领用单不存在", 404)
+    return r
+
+
+REQ_ALLOC_COLS = (
+    "SELECT a.*, c.label, c.char AS cell_char, c.font AS cell_font, "
+    "c.size AS cell_size, c.x, c.y, c.qty AS cell_qty, c.capacity, "
+    "tr.name AS tray_name, tr.scan_code AS tray_code "
+    "FROM req_allocations a "
+    "JOIN cells c ON c.id=a.cell_id "
+    "JOIN trays tr ON tr.id=a.tray_id ")
+
+
+def _load_requisition(r):
+    if not r:
+        return None
+    d = dict(r)
+    d["tray_order"] = _loads(d.get("tray_order") or "[]")
+    d["demands"] = rows(
+        "SELECT * FROM req_demands WHERE req_id=? ORDER BY seq", (d["id"],))
+    d["allocations"] = rows(
+        REQ_ALLOC_COLS + "WHERE a.req_id=? ORDER BY a.tray_id, a.seq", (d["id"],))
+    d["issues"] = rows(
+        "SELECT * FROM req_issues WHERE req_id=? ORDER BY id", (d["id"],))
+    held = _hold_map(d["id"])
+    for a in d["allocations"]:
+        a["avail_other"] = max(0, a["cell_qty"] - held.get(a["cell_id"], 0))
+    return d
+
+
+def _req_brief(r):
+    d = dict(r)
+    d["tray_order"] = _loads(d.get("tray_order") or "[]")
+    n = row("SELECT COUNT(*) AS n, COALESCE(SUM(qty),0) AS q, "
+            "COALESCE(SUM(taken_qty),0) AS t FROM req_allocations "
+            "WHERE req_id=?", (r["id"],))
+    d["n_allocs"] = n["n"]
+    d["qty_reserved"] = n["q"]
+    d["qty_taken"] = n["t"]
+    d["n_gap"] = row("SELECT COUNT(*) AS n FROM req_allocations "
+                     "WHERE req_id=? AND status='gap'", (r["id"],))["n"]
+    d["n_issue_demands"] = row(
+        "SELECT COUNT(*) AS n FROM req_demands WHERE req_id=? AND issue!=''",
+        (r["id"],))["n"]
+    return d
+
+
+def _req_current(rid):
+    return row(REQ_ALLOC_COLS + "WHERE a.req_id=? AND a.status='active' "
+               "ORDER BY a.seq LIMIT 1", (rid,))
+
+
+def _req_expected_tray(rid, order=None):
+    act = _req_current(rid)
+    if act:
+        return act["tray_id"]
+    if order is None:
+        order = _loads(row("SELECT tray_order FROM requisitions WHERE id=?",
+                           (rid,))["tray_order"])
+    rem = {x["tray_id"] for x in rows(
+        "SELECT DISTINCT tray_id FROM req_allocations WHERE req_id=? "
+        "AND status='reserved'", (rid,))}
+    return next((t for t in order if t in rem), None)
+
+
+def _req_advance(rid):
+    """确认一笔后推进：同盘下一笔自动激活；跨盘停在扫盘闸门；全部结束则完成。"""
+    r = row("SELECT * FROM requisitions WHERE id=?", (rid,))
+    if not r or r["status"] != "active":
+        return
+    cur = _req_current(rid)
+    if cur:
+        return
+    # 依据最近一次已处理的来源格判断当前盘（撤销也能回到原盘）
+    last_done = row(REQ_ALLOC_COLS +
+                    "WHERE a.req_id=? AND a.status='done' "
+                    "ORDER BY a.id DESC LIMIT 1", (rid,))
+    if last_done:
+        nxt = row("SELECT id FROM req_allocations WHERE req_id=? "
+                  "AND tray_id=? AND status='reserved' ORDER BY seq LIMIT 1",
+                  (rid, last_done["tray_id"]))
+        if nxt:
+            db.execute("UPDATE req_allocations SET status='active' WHERE id=?",
+                       (nxt["id"],))
+            return
+    if _req_expected_tray(rid) is not None:
+        return
+    left = row("SELECT COUNT(*) AS n FROM req_allocations WHERE req_id=? "
+               "AND status IN ('reserved','active')", (rid,))["n"]
+    if left == 0:
+        db.execute("UPDATE requisitions SET status='done', finished_at=? "
+                   "WHERE id=?", (now(), rid))
+
+
+def _req_remaining(alloc):
+    return alloc["qty"] - alloc["taken_qty"]
+
+
+def _req_candidates(alloc, exclude_cell_id, limit=8):
+    """同字盘、同字符同规格的其他来源格（不自动替换异体字 / 异规格）。
+
+    可用量要排除：其他领用单的预留、本单在该格尚未处理的预留
+    （改选进来会与之叠加，不能重复拿同一批铅字）。
+    """
+    out = []
+    same_req_reserved = {r["cell_id"]: r["n"] for r in rows(
+        "SELECT cell_id, COALESCE(SUM(qty-taken_qty),0) AS n "
+        "FROM req_allocations WHERE req_id=? AND status='reserved' "
+        "GROUP BY cell_id", (alloc["req_id"],))}
+    held = _hold_map(alloc["req_id"])
+    for c in rows(
+            "SELECT * FROM cells WHERE tray_id=? AND id!=? AND char=? "
+            "AND font=? AND size=? ORDER BY qty DESC, y, x, label",
+            (alloc["tray_id"], exclude_cell_id, alloc["cell_char"],
+             alloc["cell_font"], alloc["cell_size"])):
+        other_held = held.get(c["id"], 0)
+        same = same_req_reserved.get(c["id"], 0)
+        avail = max(0, c["qty"] - other_held - same)
+        if avail <= 0:
+            continue
+        out.append({"id": c["id"], "label": c["label"], "char": c["char"],
+                    "font": c["font"], "size": c["size"], "x": c["x"],
+                    "y": c["y"], "qty": c["qty"], "capacity": c["capacity"],
+                    "tray_id": c["tray_id"], "avail": avail})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def req_conflict(ctype, message, **kw):
+    c = {"type": ctype, "message": message}
+    c.update(kw)
+    return {"ok": False, "conflict": c, "state": get_state()}
+
+
+def _req_log_pick(rid, alloc_id, cell_id, tray_id, n):
+    db.execute(
+        "INSERT INTO req_issues(req_id,allocation_id,kind,cell_id,tray_id,qty,"
+        "payload,created_at) VALUES(?,?, 'pick', ?,?,?,?,?)",
+        (rid, alloc_id, cell_id, tray_id, n,
+         json.dumps({"cell_id": cell_id, "qty": n}, ensure_ascii=False), now()))
+
+
+@transactional
+def plan_requisition(rid, body):
+    """规划页：调整换盘顺序并可锁定开始执行（与归还批次同一套扫码闸门规则）。"""
+    r = _get_req(rid)
+    if r["status"] not in ("planning", "active"):
+        raise ApiError("领用单已结束，不能调整")
+    current = list(_loads(r["tray_order"]))
+    order = body.get("tray_order")
+    if order is not None:
+        if r["status"] == "active":
+            raise ApiError("领用单已锁定执行，不能再调整换盘顺序")
+        if not isinstance(order, list) or not all(isinstance(i, int)
+                                                  for i in order):
+            raise ApiError("换盘顺序格式不正确")
+        if set(order) != set(current):
+            raise ApiError("换盘顺序必须恰好包含本单涉及的 %d 个字盘"
+                           % len(current))
+        current = order
+    if body.get("lock"):
+        if r["status"] == "active":
+            raise ApiError("领用单已开始执行")
+        involved = {x["tray_id"] for x in rows(
+            "SELECT DISTINCT tray_id FROM req_allocations WHERE req_id=? "
+            "AND status!='cancelled'", (rid,))}
+        if not involved:
+            raise ApiError("本单没有可领用的格位分配（全部需求均缺字），不能锁定")
+        for tid in involved:
+            _assert_no_stocktake(tid, "锁定领用单（该盘正在盘点）")
+        bad = _check_tray_codes(involved)
+        if bad:
+            names = "；".join("「%s」%s" % (x["name"], x["problem"]) for x in bad)
+            raise ApiError("以下字盘缺少唯一可扫描的字盘码，无法开始：" + names
+                           + "。请到字盘编辑页设置后再锁定。")
+        ordered = [t for t in current if t in involved]
+        ordered += [t for t in involved if t not in ordered]
+        db.execute("UPDATE requisitions SET status='active', tray_order=? "
+                   "WHERE id=?", (json.dumps(ordered), rid))
+    else:
+        db.execute("UPDATE requisitions SET tray_order=? WHERE id=?",
+                   (json.dumps(current), rid))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def confirm_req_tray(rid, body):
+    """领用换盘闸门：每次换盘扫描字盘码核对，通过后才激活该盘首个格位。"""
+    r = _get_req(rid)
+    if r["status"] != "active":
+        raise ApiError("领用单未在执行中")
+    expected_id = _req_expected_tray(rid)
+    if expected_id is None:
+        raise ApiError("没有等待确认的字盘")
+    expected = get_tray(expected_id)
+    code = str(body.get("scan_code") or "").strip()
+    if not code:
+        raise ApiError("请扫描字盘码")
+    scanned = row("SELECT * FROM trays WHERE scan_code=? AND scan_code!=''",
+                  (code,))
+    if not scanned:
+        return req_conflict("tray_unknown",
+                            "无法识别的字盘码「%s」，请重新扫描实体字盘" % code,
+                            expected=expected, scanned_code=code)
+    if scanned["id"] != expected_id:
+        return req_conflict(
+            "tray_mismatch",
+            "字盘不符：应为「%s」（%s），扫到「%s」（%s）。请暂停核对实物，"
+            "确认换到正确字盘后再扫"
+            % (expected["name"], expected["scan_code"] or "未设码",
+               scanned["name"], scanned["scan_code"]),
+            expected=expected, scanned=scanned)
+    first = row("SELECT id FROM req_allocations WHERE req_id=? AND tray_id=? "
+                "AND status='reserved' ORDER BY seq LIMIT 1",
+                (rid, expected_id))
+    if first and not _req_current(rid):
+        db.execute("UPDATE req_allocations SET status='active' WHERE id=?",
+                   (first["id"],))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def pick_requisition(rid, body):
+    """扫描格号并确认实取数量：全取才扣库存；少取 / 扫错格先出冲突，不扣库存。"""
+    r = _get_req(rid)
+    if r["status"] != "active":
+        raise ApiError("领用单未在执行中，不能扫码取字")
+    cur = _req_current(rid)
+    if not cur:
+        raise ApiError("请先扫描当前字盘的字盘码")
+    _assert_no_stocktake(cur["tray_id"], "领用取字（该盘正在盘点）")
+    label = str(body.get("label") or "").strip()
+    if not label:
+        raise ApiError("请扫描格号")
+    scanned = row("SELECT c.*, tr.name AS tray_name FROM cells c "
+                  "JOIN trays tr ON tr.id=c.tray_id "
+                  "WHERE c.tray_id=? AND upper(c.label)=?",
+                  (cur["tray_id"], label.upper()))
+    if not scanned:
+        other = row("SELECT c.*, tr.name AS tray_name FROM cells c "
+                    "JOIN trays tr ON tr.id=c.tray_id "
+                    "WHERE upper(c.label)=?", (label.upper(),))
+        if other:
+            cur_tray = get_tray(cur["tray_id"])
+            return req_conflict(
+                "wrong_tray",
+                "扫到的格号「%s」属于字盘「%s」，当前应在「%s」上领用"
+                % (other["label"], other["tray_name"], cur_tray["name"]),
+                label=label, other_tray=other["tray_name"])
+        return req_conflict("unknown_label",
+                            "当前字盘无法识别的格号「%s」" % label, label=label)
+    if scanned["id"] != cur["cell_id"]:
+        same_spec = (scanned["char"] == cur["cell_char"]
+                     and scanned["font"] == cur["cell_font"]
+                     and scanned["size"] == cur["cell_size"])
+        return req_conflict(
+            "mismatch",
+            "实物不符：扫描到「%s」，当前应取「%s」"
+            % (scanned["label"], cur["label"]),
+            expected={"id": cur["cell_id"], "label": cur["label"],
+                      "char": cur["cell_char"], "font": cur["cell_font"],
+                      "size": cur["cell_size"], "qty": cur["cell_qty"]},
+            scanned=scanned, same_spec=same_spec,
+            candidates=_req_candidates(cur, cur["cell_id"]))
+    remain = _req_remaining(cur)
+    try:
+        n = int(body.get("qty")) if body.get("qty") not in (None, "") else remain
+    except (TypeError, ValueError):
+        raise ApiError("实取数量不正确")
+    n = max(1, min(n, remain))
+    held = _hold_map(rid).get(cur["cell_id"], 0)
+    avail = max(0, cur["cell_qty"] - held)
+    if avail < n:
+        return req_conflict(
+            "short_avail",
+            "格 %s 账面 %d 枚，扣除其他领用单预留后仅剩 %d 枚，不能取 %d 枚"
+            % (cur["label"], cur["cell_qty"], avail, n),
+            allocation=_alloc_brief(cur), picked=n,
+            candidates=_req_candidates(cur, cur["cell_id"]))
+    if n < remain:
+        return req_conflict(
+            "short_pick",
+            "少取：本格应取 %d 枚，实取 %d 枚，还差 %d 枚。请改选同盘另一来源格，"
+            "或把差额保留为缺口（确认前不扣库存）"
+            % (remain, n, remain - n),
+            allocation=_alloc_brief(cur), need=remain, picked=n,
+            candidates=_req_candidates(cur, cur["cell_id"]))
+    db.execute("UPDATE cells SET qty=qty-? WHERE id=?", (n, cur["cell_id"]))
+    db.execute("UPDATE req_allocations SET taken_qty=taken_qty+?, status='done' "
+               "WHERE id=?", (n, cur["id"]))
+    _req_log_pick(rid, cur["id"], cur["cell_id"], cur["tray_id"], n)
+    _req_advance(rid)
+    return {"ok": True, "state": get_state()}
+
+
+def _alloc_brief(a):
+    return {"id": a["id"], "label": a["label"], "cell_id": a["cell_id"],
+            "tray_id": a["tray_id"], "char": a["cell_char"],
+            "font": a["cell_font"], "size": a["cell_size"],
+            "qty": a["qty"], "taken_qty": a["taken_qty"],
+            "remain": a["qty"] - a["taken_qty"]}
+
+
+@transactional
+def change_req_source(rid, body):
+    """少取 / 扫错格后改选另一来源格（限同字盘同规格）。
+
+    picked=已从原格实取的枚数（默认 0）：原格先按实取扣库存并结束，
+    余量在新格新建一笔当前分配，继续扫码确认；不直接扣新格库存。
+    """
+    r = _get_req(rid)
+    if r["status"] != "active":
+        raise ApiError("领用单未在执行中")
+    alloc = row(REQ_ALLOC_COLS + "WHERE a.id=?", (body.get("allocation_id"),))
+    if not alloc or alloc["req_id"] != rid:
+        alloc = _req_current(rid)
+    if not alloc:
+        raise ApiError("没有进行中的来源格")
+    if alloc["status"] != "active":
+        raise ApiError("该来源格已处理")
+    _assert_no_stocktake(alloc["tray_id"], "改选来源格（该盘正在盘点）")
+    new = row("SELECT * FROM cells WHERE id=?", (body.get("cell_id"),))
+    if not new:
+        raise ApiError("请选择新的来源格")
+    if new["tray_id"] != alloc["tray_id"]:
+        raise ApiError("不能跨字盘改选来源格；跨盘必须先扫字盘码走换盘闸门")
+    if (new["char"], new["font"], new["size"]) != (
+            alloc["cell_char"], alloc["cell_font"], alloc["cell_size"]):
+        raise ApiError("异体字 / 规格不符的格位不能自动替换，请人工处理")
+    remain = _req_remaining(alloc)
+    try:
+        picked = int(body.get("picked") or 0)
+    except (TypeError, ValueError):
+        raise ApiError("实取数量不正确")
+    picked = max(0, min(picked, remain))
+    qnew = remain - picked
+    if qnew < 1:
+        raise ApiError("差额为 0：无需改选，直接确认实取即可")
+    # 目标格可用量排除旧来源格（即将完成）；若该格在本单已有预留（exist），
+    # 余量并入后会与之叠加，合并后总量不能超过该格实际可拿量
+    exist = row("SELECT * FROM req_allocations WHERE req_id=? AND cell_id=? "
+                "AND id!=? AND status='reserved' ORDER BY seq LIMIT 1",
+                (rid, new["id"], alloc["id"]))
+    # 可用实物 = 当前存量 − 其他领用单预留；本单在该格的其他预留是本单自己
+    # 要取的量，先加回，随后按是否并入 exist 统一校验叠加后的总量
+    same_req_held = row(
+        "SELECT COALESCE(SUM(qty-taken_qty),0) AS n FROM req_allocations "
+        "WHERE req_id=? AND cell_id=? AND id!=? AND status='reserved'",
+        (rid, new["id"], alloc["id"]))["n"]
+    other_held = _held_on_cell(new["id"]) - same_req_held
+    avail = max(0, new["qty"] - other_held)
+    if exist:
+        if exist["qty"] - exist["taken_qty"] + qnew > avail:
+            raise ApiError("格 %s 可用数量不足 %d 枚（含本单已预留 %d 枚）"
+                           % (new["label"], qnew,
+                              exist["qty"] - exist["taken_qty"]))
+    elif avail < qnew:
+        raise ApiError("格 %s 可用数量不足 %d 枚" % (new["label"], qnew))
+    old_cell = row("SELECT * FROM cells WHERE id=?", (alloc["cell_id"],))
+    if old_cell["qty"] < picked:
+        raise ApiError("原格实际存量仅 %d 枚，实取数量不符" % old_cell["qty"])
+    ts = now()
+    if picked:
+        db.execute("UPDATE cells SET qty=qty-? WHERE id=?",
+                   (picked, old_cell["id"]))
+    db.execute("UPDATE req_allocations SET taken_qty=taken_qty+?, status='done' "
+               "WHERE id=?", (picked, alloc["id"]))
+    if exist:
+        # 余量并入同规格同格的既有预留：提前激活，路线上只来访一次
+        db.execute("UPDATE req_allocations SET qty=qty+?, status='active' "
+                   "WHERE id=?", (qnew, exist["id"]))
+        new_id = exist["id"]
+    else:
+        cur2 = db.execute(
+            "INSERT INTO req_allocations(req_id,demand_id,tray_id,cell_id,qty,"
+            "taken_qty,status,seq,created_at) VALUES(?,?,?,?,?,0, 'active', ?,?)",
+            (rid, alloc["demand_id"], alloc["tray_id"], new["id"], qnew,
+             alloc["seq"], ts))
+        new_id = cur2.lastrowid
+    db.execute(
+        "INSERT INTO req_issues(req_id,allocation_id,kind,cell_id,tray_id,qty,"
+        "payload,created_at) VALUES(?,?, 'change', ?,?,?,?,?)",
+        (rid, alloc["id"], new["id"], alloc["tray_id"], qnew,
+         json.dumps({"old_allocation_id": alloc["id"],
+                     "new_allocation_id": new_id, "old_cell_id": alloc["cell_id"],
+                     "new_cell_id": new["id"], "picked": picked, "qty": qnew,
+                     "merged": bool(exist)}, ensure_ascii=False), ts))
+    return {"ok": True, "new_allocation_id": new_id, "state": get_state()}
+
+
+@transactional
+def keep_req_gap(rid, body):
+    """少取后保留缺口：原格按实取扣库存，差额单列 gap 分配，不再占库存。"""
+    r = _get_req(rid)
+    if r["status"] != "active":
+        raise ApiError("领用单未在执行中")
+    alloc = row(REQ_ALLOC_COLS + "WHERE a.id=?", (body.get("allocation_id"),))
+    if not alloc or alloc["req_id"] != rid:
+        alloc = _req_current(rid)
+    if not alloc or alloc["status"] != "active":
+        raise ApiError("没有进行中的来源格")
+    _assert_no_stocktake(alloc["tray_id"], "保留缺口（该盘正在盘点）")
+    remain = _req_remaining(alloc)
+    try:
+        picked = int(body.get("picked") or 0)
+    except (TypeError, ValueError):
+        raise ApiError("实取数量不正确")
+    picked = max(0, min(picked, remain))
+    gap_n = remain - picked
+    if gap_n < 1:
+        raise ApiError("差额为 0：无需保留缺口，直接确认实取即可")
+    old_cell = row("SELECT * FROM cells WHERE id=?", (alloc["cell_id"],))
+    if old_cell["qty"] < picked:
+        raise ApiError("原格实际存量仅 %d 枚，实取数量不符" % old_cell["qty"])
+    ts = now()
+    if picked:
+        db.execute("UPDATE cells SET qty=qty-? WHERE id=?",
+                   (picked, old_cell["id"]))
+    db.execute("UPDATE req_allocations SET taken_qty=taken_qty+?, status='done' "
+               "WHERE id=?", (picked, alloc["id"]))
+    cur = db.execute(
+        "INSERT INTO req_allocations(req_id,demand_id,tray_id,cell_id,qty,"
+        "taken_qty,status,seq,created_at) VALUES(?,?,?,?,?,0, 'gap', ?,?)",
+        (rid, alloc["demand_id"], alloc["tray_id"], alloc["cell_id"], gap_n,
+         alloc["seq"], ts))
+    gap_id = cur.lastrowid
+    db.execute(
+        "INSERT INTO req_issues(req_id,allocation_id,kind,cell_id,tray_id,qty,"
+        "payload,created_at) VALUES(?,?, 'gap', ?,?,?,?,?)",
+        (rid, gap_id, alloc["cell_id"], alloc["tray_id"], gap_n,
+         json.dumps({"parent_allocation_id": alloc["id"], "picked": picked,
+                     "qty": gap_n}, ensure_ascii=False), ts))
+    _req_advance(rid)
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def undo_requisition(rid):
+    """撤销上一笔（实取 / 改选 / 缺口），库存与领用单状态一并回退。"""
+    r = _get_req(rid)
+    if r["status"] == "cancelled":
+        raise ApiError("领用单已取消，不能撤销")
+    if r["status"] == "done" and row(
+            "SELECT id FROM requisitions WHERE status IN ('planning','active') "
+            "AND id!=?", (rid,)):
+        raise ApiError("已有其他进行中的领用单，请先处理后再撤销")
+    last = row("SELECT * FROM req_issues WHERE req_id=? ORDER BY id DESC LIMIT 1",
+               (rid,))
+    if not last:
+        raise ApiError("没有可撤销的操作")
+    payload = json.loads(last["payload"] or "{}")
+    if last["kind"] == "pick":
+        p = payload
+        db.execute("UPDATE cells SET qty=qty+? WHERE id=?",
+                   (p["qty"], p["cell_id"]))
+        a = row("SELECT * FROM req_allocations WHERE id=?", (last["allocation_id"],))
+        if a:
+            db.execute("UPDATE req_allocations SET status='active', "
+                       "taken_qty=max(taken_qty-?,0) WHERE id=?",
+                       (p["qty"], a["id"]))
+    elif last["kind"] == "gap":
+        gap = row("SELECT * FROM req_allocations WHERE id=?",
+                  (last["allocation_id"],))
+        parent_id = payload.get("parent_allocation_id")
+        parent = row("SELECT * FROM req_allocations WHERE id=?", (parent_id,))
+        picked = int(payload.get("picked") or 0)
+        if gap:
+            db.execute("DELETE FROM req_allocations WHERE id=?", (gap["id"],))
+        if parent:
+            # 恢复原格：状态回到当前、taken 回退、实取部分库存补回
+            db.execute("UPDATE req_allocations SET status='active', "
+                       "taken_qty=max(taken_qty-?,0) WHERE id=?",
+                       (picked, parent["id"]))
+            if picked:
+                db.execute("UPDATE cells SET qty=qty+? WHERE id=?",
+                           (picked, parent["cell_id"]))
+    elif last["kind"] == "change":
+        new_id = payload.get("new_allocation_id")
+        new_a = row("SELECT * FROM req_allocations WHERE id=?", (new_id,))
+        parent = row("SELECT * FROM req_allocations WHERE id=?",
+                     (payload.get("old_allocation_id"),))
+        picked = int(payload.get("picked") or 0)
+        if new_a:
+            if payload.get("merged"):
+                # 余量并入的是既有预留：拆回预留量与状态，不删除该分配
+                db.execute("UPDATE req_allocations SET status='reserved', "
+                           "qty=max(qty-?,0), taken_qty=0 WHERE id=?",
+                           (last["qty"], new_a["id"]))
+            else:
+                db.execute("DELETE FROM req_allocations WHERE id=?", (new_a["id"],))
+        if parent:
+            db.execute("UPDATE req_allocations SET status='active', "
+                       "taken_qty=max(taken_qty-?,0) WHERE id=?",
+                       (picked, parent["id"]))
+            if picked:
+                db.execute("UPDATE cells SET qty=qty+? WHERE id=?",
+                           (picked, parent["cell_id"]))
+    db.execute("DELETE FROM req_issues WHERE id=?", (last["id"],))
+    db.execute("UPDATE requisitions SET status='active', finished_at=NULL "
+               "WHERE id=?", (rid,))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def cancel_requisition(rid):
+    """取消领用单：未取预留全部释放，已实取数量保留在领用清单里。"""
+    r = _get_req(rid)
+    if r["status"] not in ("planning", "active"):
+        raise ApiError("领用单已结束，不能取消")
+    db.execute("UPDATE req_allocations SET status='cancelled' WHERE req_id=? "
+               "AND status IN ('reserved','active')", (rid,))
+    db.execute("UPDATE requisitions SET status='cancelled', cancelled_at=? "
+               "WHERE id=?", (now(), rid))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def finish_requisition(rid):
+    r = _get_req(rid)
+    if r["status"] != "active":
+        raise ApiError("领用单未在执行中")
+    left = row("SELECT COUNT(*) AS n FROM req_allocations WHERE req_id=? "
+               "AND status IN ('reserved','active')", (rid,))["n"]
+    if left:
+        raise ApiError("还有 %d 个来源格未确认" % left)
+    db.execute("UPDATE requisitions SET status='done', finished_at=? WHERE id=?",
+               (now(), rid))
+    return {"ok": True, "state": get_state()}
+
+
+@transactional
+def requisition_to_return(rid):
+    """完成的领用单一键带入现有归还流程：按实取数量生成归还批次（逐格扫码照旧）。"""
+    r = _get_req(rid)
+    if r["status"] != "done":
+        raise ApiError("只有已完成的领用单可以带入归还流程")
+    if r["returned_session_id"]:
+        raise ApiError("本领用单已生成归还批次（#%d）" % r["returned_session_id"])
+    if row("SELECT id FROM sessions WHERE status IN ('planning','active')"):
+        raise ApiError("已有进行中的归还批次，请先完成或作废")
+    allocs = rows(REQ_ALLOC_COLS + "WHERE a.req_id=? AND a.status='done' "
+                  "AND a.taken_qty>0", (rid,))
+    if not allocs:
+        raise ApiError("本领用单没有实取记录，无需归还")
+    merged = {}
+    for a in allocs:
+        merged.setdefault((a["tray_id"], a["cell_id"]), {
+            "tray_id": a["tray_id"], "cell_id": a["cell_id"],
+            "char": a["cell_char"], "font": a["cell_font"],
+            "size": a["cell_size"], "qty": 0, "x": a["x"], "y": a["y"]})
+        merged[(a["tray_id"], a["cell_id"])]["qty"] += a["taken_qty"]
+    cur = db.execute(
+        "INSERT INTO sessions(name,status,created_at) VALUES(?, 'planning', ?)",
+        ("领用单 #%d 归还 · %s" % (rid, r["name"]), now()))
+    sid = cur.lastrowid
+    tray_order = []
+    for tr in rows("SELECT * FROM trays ORDER BY sort_order, id"):
+        group = [v for v in merged.values() if v["tray_id"] == tr["id"]]
+        if not group:
+            continue
+        tray_order.append(tr["id"])
+        for i, t in enumerate(plan_order(group)):
+            db.execute(
+                "INSERT INTO tasks(session_id,tray_id,cell_id,char,font,size,"
+                "qty,seq,note) VALUES(?,?,?,?,?,?,?,?,?)",
+                (sid, tr["id"], t["cell_id"], t["char"], t["font"], t["size"],
+                 t["qty"], i + 1, "领用单 #%d 带入" % rid))
+    db.execute("UPDATE sessions SET tray_order=?, start_tray_id=? WHERE id=?",
+               (json.dumps(tray_order),
+                tray_order[0] if tray_order else None, sid))
+    db.execute("UPDATE requisitions SET returned_session_id=? WHERE id=?",
+               (sid, rid))
+    return {"ok": True, "session_id": sid, "state": get_state()}
+
+
+def get_requisition_detail(rid):
+    return {"ok": True, "requisition": _load_requisition(_get_req(rid))}
+
 
 # ---------------------------------------------------------------- 盘点 API
 
@@ -1959,8 +2824,10 @@ def post_stocktake(sid):
 
 TABLES = ["trays", "cells", "sessions", "tasks", "pending_items", "actions",
           "stocktakes", "stocktake_cells", "discrepancies",
-          "discrepancy_pairs", "move_tasks", "postings"]
-DELETE_ORDER = ["postings", "move_tasks", "discrepancy_pairs", "discrepancies",
+          "discrepancy_pairs", "move_tasks", "postings",
+          "requisitions", "req_demands", "req_allocations", "req_issues"]
+DELETE_ORDER = ["req_issues", "req_allocations", "req_demands", "requisitions",
+                "postings", "move_tasks", "discrepancy_pairs", "discrepancies",
                 "stocktake_cells", "stocktakes",
                 "actions", "pending_items", "tasks", "sessions", "cells",
                 "trays"]
@@ -1968,7 +2835,7 @@ DELETE_ORDER = ["postings", "move_tasks", "discrepancy_pairs", "discrepancies",
 
 def backup():
     with DB_LOCK:
-        return {"app": "sortify", "version": 3, "exported_at": now(),
+        return {"app": "sortify", "version": 4, "exported_at": now(),
                 "tables": {t: rows("SELECT * FROM %s" % t) for t in TABLES}}
 
 
@@ -2229,6 +3096,36 @@ def handle_api(method, path, body):
     m = re.fullmatch(r"/api/pending/(\d+)/resolve", path)
     if m and method == "POST":
         return resolve_pending(int(m.group(1)), body)
+
+    # ---- 配字领用 ----
+    if method == "POST" and path == "/api/requisitions":
+        return create_requisition(body)
+    m = re.fullmatch(r"/api/requisitions/(\d+)", path)
+    if m and method == "GET":
+        return get_requisition_detail(int(m.group(1)))
+    m = re.fullmatch(r"/api/requisitions/(\d+)/(plan|confirm-tray|pick|undo|"
+                     r"cancel|finish|to-return)", path)
+    if m and method == "POST":
+        rid, action = int(m.group(1)), m.group(2)
+        if action == "plan":
+            return plan_requisition(rid, body)
+        if action == "confirm-tray":
+            return confirm_req_tray(rid, body)
+        if action == "pick":
+            return pick_requisition(rid, body)
+        if action == "undo":
+            return undo_requisition(rid)
+        if action == "cancel":
+            return cancel_requisition(rid)
+        if action == "finish":
+            return finish_requisition(rid)
+        return requisition_to_return(rid)
+    m = re.fullmatch(r"/api/requisitions/(\d+)/(change-source|keep-gap)", path)
+    if m and method == "POST":
+        rid = int(m.group(1))
+        if m.group(2) == "change-source":
+            return change_req_source(rid, body)
+        return keep_req_gap(rid, body)
 
     # ---- 盘点 ----
     if method == "POST" and path == "/api/stocktakes":

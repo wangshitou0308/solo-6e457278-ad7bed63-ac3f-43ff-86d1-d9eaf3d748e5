@@ -10,6 +10,7 @@
 <header>
   <h1>铅字归还助手</h1>
   <nav>
+    <button class="nav-btn" data-view="pick">配字领用 <span id="reqBadge" class="badge" hidden></span></button>
     <button class="nav-btn" data-view="run">归还作业</button>
     <button class="nav-btn" data-view="stock">实体盘点 <span id="stockBadge" class="badge" hidden></span></button>
     <button class="nav-btn" data-view="tray">字盘编辑</button>
@@ -132,6 +133,15 @@
     </div>
   </section>
 
+  <!-- ============ 配字领用 ============ -->
+  <section id="view-pick" class="view">
+    <div id="reqWork"></div>
+    <div class="panel">
+      <h2>领用单记录</h2>
+      <div id="reqHistory"></div>
+    </div>
+  </section>
+
   <!-- ============ 字盘编辑 ============ -->
   <section id="view-tray" class="view">
     <div class="panel tray-bar">
@@ -241,6 +251,12 @@
       <button id="btnPrint">打印标签</button>
     </div>
     <div class="panel">
+      <h2>打印领用单</h2>
+      <p class="hint">按当前领用单（无进行中时为最近一张）打印领用清单：
+        包含领用单、预留数量、实取数量与来源格（含缺口），供签字核对。</p>
+      <button id="btnPrintReq">打印领用单 / 标签</button>
+    </div>
+    <div class="panel">
       <h2>打印盘点差异单</h2>
       <p class="hint">对当前差异复核中的盘点单（或最近一次已入账盘点单），按格打印
         短缺、溢出、规格不符、错放候选与待复核项，供纸面核对签字。</p>
@@ -248,7 +264,8 @@
     </div>
     <div class="panel">
       <h2>备份与恢复</h2>
-      <p class="hint">备份包含全部字盘及其归属（旧版单字盘备份恢复时自动归入「默认字盘」）。</p>
+      <p class="hint">备份 v4 包含全部字盘、盘点记录与<strong>配字领用单（需求、预留、实取与来源格）</strong>，
+        旧版单字盘备份恢复时自动归入「默认字盘」。</p>
       <div class="row">
         <button id="btnBackup">导出 JSON 备份</button>
         <label class="btn-file">恢复备份<input id="restoreFile" type="file" accept=".json" hidden></label>

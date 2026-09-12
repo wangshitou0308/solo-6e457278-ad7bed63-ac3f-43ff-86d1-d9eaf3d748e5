@@ -3,7 +3,9 @@
 
 let S = { trays: [], cells: [], session: null, last_done: null, pending: [],
           conflicts: {}, reason_names: {},
-          stocktakes: [], stocktake_history: [] };
+          stocktakes: [], stocktake_history: [],
+          requisition: null, req_history: [],
+          req_status_names: {}, alloc_status_names: {}, req_issue_names: {} };
 let view = 'run';
 let editTrayId = null;       // 字盘编辑页当前选中的字盘
 let startTrayId = null;      // 规划页选择的起始盘（本地草稿）
@@ -180,6 +182,11 @@ function switchView(v) {
   $$('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === v));
   $$('.view').forEach((s) => { s.hidden = s.id !== 'view-' + v; });
   if (v === 'run') setTimeout(focusRunInput, 50);
+  if (v === 'pick') setTimeout(() => {
+    const inp = S.requisition && S.requisition.status === 'active'
+      ? ($('#reqGateInput') || $('#reqScan')) : $('#reqText');
+    if (inp) inp.focus();
+  }, 50);
 }
 
 function focusRunInput() {
@@ -1039,6 +1046,15 @@ function bindData() {
   });
   // 无进行中批次时，补打最近完成批次的标签
   $('#btnPrint').onclick = () => printLabels(S.session || S.last_done);
+  $('#btnPrintReq').onclick = () => guard(async () => {
+    let req = S.requisition;
+    if (!req) {
+      const h = (S.req_history || [])[0];
+      if (h) req = (await api('/api/requisitions/' + h.id)).requisition;
+    }
+    if (!req) { toast('没有可打印的领用单', true); return; }
+    printRequisition(req);
+  });
   $('#btnPrintStock').onclick = () => guard(async () => {
     let st = (S.stocktakes || [])[0];
     if (!st) {
@@ -1136,6 +1152,12 @@ function bindRun() {
 let stockSelId = null;        // 盘点页当前打开的盘点单
 let stockConflict = null;     // 盘点扫码冲突
 let moveStageCtx = null;      // 移格复扫面板上下文 {taskId, inputVal}
+
+/* ---------------- 配字领用 ---------------- */
+
+let reqSelId = null;          // 领用页当前查看的历史领用单
+let reqConflict = null;       // 领用扫码冲突上下文
+let reqTrayGate = null;       // 换盘闸门扫码结果冲突
 
 const stockById = (id) =>
   (S.stocktakes || []).find((x) => x.id === id) || null;
@@ -1804,6 +1826,688 @@ function bindStockStart() {
   inp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') go(); });
 }
 
+/* ---------------- 配字领用 ---------------- */
+
+const REQ_INPUT_KEY = 'sortify-req-input-v1';
+let reqDraft = { mode: 'text', include_spaces: false,
+                 include_punct: true, text: '' };
+
+function reqName(st, field) {
+  return (S.req_status_names || {})[st[field]] || st[field];
+}
+const allocName = (s) => (S.alloc_status_names || {})[s] || s;
+
+function reqById(id) {
+  const list = [S.requisition].concat(S.req_history || []);
+  return list.find((x) => x && x.id === id) || null;
+}
+
+function reqDemandProgress(req, dm) {
+  const allocs = req.allocations.filter((a) => a.demand_id === dm.id);
+  const reserved = allocs.reduce((a, x) =>
+    a + (x.status === 'cancelled' ? 0 : x.qty), 0);
+  const taken = allocs.reduce((a, x) => a + x.taken_qty, 0);
+  const gap = allocs.filter((x) => x.status === 'gap')
+    .reduce((a, x) => a + x.qty, 0);
+  return { reserved, taken, gap, missing: dm.qty - reserved };
+}
+
+function reqOrder(req) {
+  const fromTasks = Array.from(new Set(
+    req.allocations.filter((a) => a.status !== 'cancelled').map((a) => a.tray_id)));
+  const stored = (req.tray_order || []).filter((id) =>
+    S.trays.some((t) => t.id === id));
+  return stored.length ? stored : fromTasks;
+}
+
+function reqCurrentAlloc(req) {
+  return (req.allocations || []).find((a) => a.status === 'active') || null;
+}
+
+function reqGateTray(req) {
+  if (!req || req.status !== 'active' || reqCurrentAlloc(req)) return null;
+  const pending = new Set(req.allocations
+    .filter((a) => a.status === 'reserved').map((a) => a.tray_id));
+  return reqOrder(req).find((id) => pending.has(id)) || null;
+}
+
+function reqTraySummary(req, tid) {
+  const ts = req.allocations.filter((a) => a.tray_id === tid
+    && a.status !== 'cancelled');
+  return {
+    total: ts.length,
+    done: ts.filter((a) => a.status === 'done').length,
+    gap: ts.filter((a) => a.status === 'gap').length,
+    qty: ts.reduce((a, x) => a + x.qty, 0),
+    taken: ts.reduce((a, x) => a + x.taken_qty, 0),
+  };
+}
+
+function renderPick() {
+  const badge = $('#reqBadge');
+  if (S.requisition) {
+    badge.hidden = false;
+    badge.textContent = S.requisition.status === 'active'
+      ? (S.requisition.allocations.filter((a) =>
+        ['reserved', 'active'].includes(a.status)).length || '')
+      : '待';
+  } else {
+    badge.hidden = true;
+  }
+  const work = $('#reqWork');
+  const req = S.requisition;
+  if (!req) {
+    work.innerHTML = reqFormHtml() + reqActiveNoneHtml();
+    bindReqForm(work);
+  } else if (req.status === 'planning') {
+    work.innerHTML = reqPlanningHtml(req);
+    bindReqPlanning(req);
+  } else if (req.status === 'active') {
+    work.innerHTML = reqActiveHtml(req);
+    bindReqActive(req);
+    drawReqTray(req);
+  }
+  renderReqHistory();
+}
+
+function reqActiveNoneHtml() {
+  const last = (S.req_history || [])[0];
+  if (!last) return '';
+  const st = last.status;
+  return '<div class="panel"><h2>最近领用单：#' + last.id + ' ' + esc(last.name) +
+    ' <span class="stk-status st-' + st + '">' +
+    (S.req_status_names[st] || st) + '</span></h2>' +
+    '<p class="muted">' + esc(last.created_at) + ' · ' + last.n_allocs +
+    ' 个来源格 · 实取 ' + last.qty_taken + ' 枚' +
+    (last.n_gap ? ' · <span class="diff-up">缺口 ' + last.n_gap + ' 笔</span>' : '') +
+    '</p><div class="row"><button data-req-open="' + last.id + '">查看 / 打印</button>' +
+    (st === 'done' && !last.returned_session_id
+      ? '<button data-req-return="' + last.id + '" class="primary">一键带入归还流程</button>'
+      : '') + '</div></div>';
+}
+
+/* ---- 新建领用单 ---- */
+
+function reqFormHtml() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(REQ_INPUT_KEY) || 'null');
+    if (saved) Object.assign(reqDraft, saved);
+  } catch (e) { /* ignore */ }
+  const d = reqDraft;
+  return '<div class="panel"><h2>新建配字领用单</h2>' +
+    '<p class="hint">粘贴<strong>待排文字</strong>逐字汇总，或切换为' +
+    '「字符、数量、字体、字号」清单（写法同归还清单，如 <code>永,12,宋体,五号</code>）。' +
+    '系统从<strong>多个字盘的同规格格位</strong>分配可用铅字，并扣除其他未完成领用单的' +
+    '预留量；数量不足、仅有异体字或规格不符分别列出，<b>不自动替换</b>。</p>' +
+    '<div class="row"><label class="radio"><input type="radio" name="reqMode" ' +
+    (d.mode === 'text' ? 'checked' : '') + ' value="text"> 待排文字（逐字计数）</label>' +
+    '<label class="radio"><input type="radio" name="reqMode" ' +
+    (d.mode === 'list' ? 'checked' : '') + ' value="list"> 字符 / 数量 / 字体 / 字号清单</label></div>' +
+    '<textarea id="reqText" rows="7" placeholder="' +
+    (d.mode === 'text' ? '例如：永和九年，岁在癸丑' : '例如：&#10;永,12,宋体,五号&#10;體 2&#10;的×30') +
+    '">' + esc(d.text) + '</textarea>' +
+    '<div class="row">' +
+    '<label class="radio"><input type="checkbox" id="reqSpaces" ' +
+    (d.include_spaces ? 'checked' : '') + '> 计入空格</label>' +
+    '<label class="radio"><input type="checkbox" id="reqPunct" ' +
+    (d.include_punct ? 'checked' : '') + '> 计入标点</label></div>' +
+    '<p class="hint" id="reqModeHint"></p>' +
+    '<div class="row"><button id="btnReqCreate" class="primary">汇总需求并分配字盘</button></div>' +
+    '<div id="reqCreateMsg"></div></div>';
+}
+
+function bindReqForm(scope) {
+  const saveDraft = () => {
+    reqDraft.text = $('#reqText').value;
+    reqDraft.include_spaces = $('#reqSpaces').checked;
+    reqDraft.include_punct = $('#reqPunct').checked;
+    localStorage.setItem(REQ_INPUT_KEY, JSON.stringify(reqDraft));
+  };
+  scope.querySelectorAll('input[name=reqMode]').forEach((r) => {
+    r.onchange = () => {
+      saveDraft();
+      reqDraft.mode = r.value;
+      localStorage.setItem(REQ_INPUT_KEY, JSON.stringify(reqDraft));
+      renderPick();
+    };
+  });
+  const updateHint = () => {
+    const h = $('#reqModeHint');
+    if (!h) return;
+    const v = $('#reqText').value;
+    if (reqDraft.mode === 'text') {
+      let nSpace = 0, nPunct = 0, nChar = 0;
+      for (const ch of v) {
+        const cat = /\p{Z}/u.test(ch) ? 'Z'
+          : /\p{P}/u.test(ch) ? 'P' : '';
+        if (cat === 'Z') nSpace++;
+        else if (cat === 'P') nPunct++;
+        else if (ch.trim()) nChar++;
+      }
+      h.textContent = '当前 ' + nChar + ' 个实字' +
+        (nSpace ? '、' + nSpace + ' 个空格' : '') +
+        (nPunct ? '、' + nPunct + ' 个标点' : '') + '；字体 / 字号不限，按同字符各格匹配。';
+    } else {
+      h.textContent = '每行一条，支持 永 12 / 永×12 / 永,12,宋体,五号；未写字体字号时按同字符匹配。';
+    }
+  };
+  $('#reqText').addEventListener('input', () => { saveDraft(); updateHint(); });
+  $('#reqSpaces').onchange = saveDraft;
+  $('#reqPunct').onchange = saveDraft;
+  updateHint();
+  $('#btnReqCreate').onclick = () => guard(async () => {
+    saveDraft();
+    const res = await api('/api/requisitions', 'POST', {
+      text: reqDraft.text, mode: reqDraft.mode,
+      include_spaces: reqDraft.include_spaces,
+      include_punct: reqDraft.include_punct,
+    });
+    applyState(res.state);
+    reqSelId = res.requisition_id;
+    let msg = '领用单 #' + res.requisition_id + ' 已生成';
+    if (res.dropped_spaces) msg += '，已排除空格 ' + res.dropped_spaces;
+    if (res.dropped_punct) msg += '，已排除标点 ' + res.dropped_punct;
+    toast(msg);
+  });
+  scope.querySelectorAll('[data-req-open]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      const r = await api('/api/requisitions/' + b.dataset.reqOpen);
+      printRequisition(r.requisition);
+    });
+  });
+  scope.querySelectorAll('[data-req-return]').forEach((b) => {
+    b.onclick = () => reqToReturn(parseInt(b.dataset.reqReturn, 10));
+  });
+}
+
+/* ---- 规划页 ---- */
+
+function reqPlanningHtml(req) {
+  const order = reqOrder(req);
+  const issueBadge = (dm) => {
+    if (!dm.issue) return '<span class="diff-ok">已配齐</span>';
+    const name = { short: '数量不足', variant: '仅有异体字',
+      spec: '规格不符', none: '无格位' }[dm.issue] || dm.issue;
+    return '<span class="diff-up">' + name + '</span>';
+  };
+  const demands = req.demands.map((dm) => {
+    const p = reqDemandProgress(req, dm);
+    return '<tr><td class="big-char">' + esc(dm.char) + '</td>' +
+      '<td>' + esc(dm.font || '任意') + ' / ' + esc(dm.size || '任意') + '</td>' +
+      '<td>' + dm.qty + '</td><td>' + p.reserved + '</td>' +
+      '<td>' + (p.gap ? '<span class="diff-up">' + p.gap + '</span>' : '—') +
+      '</td><td>' + issueBadge(dm) +
+      (dm.issue_text ? '<div class="muted">' + esc(dm.issue_text) + '</div>' : '') +
+      '</td></tr>';
+  }).join('');
+  const codeProblems = new Map();
+  const seen = new Map();
+  for (const tid of order) {
+    const tr = trayById(tid);
+    const code = (tr.scan_code || '').trim();
+    if (!code) codeProblems.set(tid, '未设扫描码');
+    else if (seen.has(code.toUpperCase()))
+      codeProblems.set(tid, '扫描码重复');
+    else seen.set(code.toUpperCase(), tr.name);
+  }
+  const groups = order.map((tid, i) => {
+    const tr = trayById(tid);
+    const allocs = req.allocations
+      .filter((a) => a.tray_id === tid && a.status !== 'cancelled')
+      .sort((a, b) => a.seq - b.seq);
+    const sum = reqTraySummary(req, tid);
+    return '<div class="tgroup' + (codeProblems.has(tid) ? ' gate' : '') + '">' +
+      '<div class="tg-head">' + (i + 1) + '. <b>' + esc(tr.name) + '</b> ' +
+      '<span class="mono dim">' + esc(tr.scan_code || '—') + '</span>' +
+      '<span class="tg-prog">' + allocs.length + ' 格 / ' +
+      sum.qty + ' 枚</span></div>' +
+      '<div class="tg-cells">' + allocs.map((a) =>
+        '<span class="tg-cell" title="' + esc(a.cell_char) + ' ×' + a.qty +
+        '">' + esc(a.label) + '×' + a.qty + '</span>').join(' ') +
+      '</div></div>';
+  }).join('');
+  return '<div class="plan-layout"><div class="panel">' +
+    '<div class="row between"><h2>领用单 #' + req.id + ' · ' + esc(req.name) +
+    '（待锁定）</h2><span class="muted">' + esc(req.created_at) + '</span></div>' +
+    '<table class="tasks"><thead><tr><th>字符</th><th>字体 / 字号</th>' +
+    '<th>需求</th><th>已配</th><th>缺口</th><th>状态</th></tr></thead><tbody>' +
+    demands + '</tbody></table>' +
+    '<div class="row">' +
+    '<button id="btnReqLock" class="primary"' +
+    (codeProblems.size || !req.allocations.length ? ' disabled' : '') +
+    '>锁定来源格，开始领用</button>' +
+    '<button id="btnReqCancelPlan" class="danger">取消领用单（释放预留）</button>' +
+    '<button id="btnReqPrintPlan">打印领用单</button></div>' +
+    (codeProblems.size ? '<p class="diff-up code-warn">涉及字盘存在未设 / 重复扫描码，' +
+      '请到字盘编辑页设置后再锁定。</p>' : '') +
+    (!req.allocations.length ? '<p class="diff-up code-warn">没有任何可配格位，不能锁定；' +
+      '本单需求已逐条列出。</p>' : '') +
+    '</div><div class="panel"><h3>按字盘的领用路线（盘内蛇形）</h3>' + groups + '</div></div>';
+}
+
+function bindReqPlanning(req) {
+  $('#btnReqLock').onclick = () => guard(async () => {
+    const res = await api('/api/requisitions/' + req.id + '/plan', 'POST',
+      { lock: true });
+    applyState(res.state);
+    toast('来源格已锁定，请扫描起始字盘的字盘码');
+  });
+  $('#btnReqCancelPlan').onclick = () => guard(async () => {
+    if (!confirm('取消领用单 #' + req.id + '？未取预留将全部释放。')) return;
+    applyState((await api('/api/requisitions/' + req.id + '/cancel', 'POST')).state);
+    reqConflict = null;
+    toast('领用单已取消，预留已释放');
+  });
+  $('#btnReqPrintPlan').onclick = () => {
+    const full = reqById(req.id);
+    if (full && full.allocations) printRequisition(full);
+  };
+}
+
+/* ---- 执行页 ---- */
+
+function reqActiveHtml(req) {
+  const order = reqOrder(req);
+  const cur = reqCurrentAlloc(req);
+  const gateId = reqGateTray(req);
+  const curTrayId = cur ? cur.tray_id : (gateId || order[0]);
+  const curTray = trayById(curTrayId);
+  const taken = req.allocations.reduce((a, x) => a + x.taken_qty, 0);
+  const total = req.allocations.filter((a) => a.status !== 'cancelled')
+    .reduce((a, x) => a + x.qty, 0);
+  const doneAllocs = req.allocations.filter((a) => a.status === 'done').length;
+  const totalAllocs = req.allocations.filter((a) =>
+    a.status !== 'cancelled').length;
+  let curCard = '<p class="hint">等待扫描字盘码，确认换到下一个字盘。</p>';
+  if (cur) {
+    const remain = cur.qty - cur.taken_qty;
+    curCard = '<div class="cur-task"><div class="cur-char">' +
+      esc(cur.cell_char) + '</div><div class="cur-meta">' +
+      '<div>' + esc(cur.tray_name) + ' · 来源格 <b>' + esc(cur.label) +
+      '</b> · ' + esc(cur.cell_font || '—') + ' · ' + esc(cur.cell_size || '—') + '</div>' +
+      '<div>应取 <b>' + cur.qty + '</b> 枚 · 已取 ' + cur.taken_qty +
+      ' · 格内存量 ' + cur.cell_qty + '（扣除其他预留后可拿 ' + cur.avail_other + '）</div>' +
+      '<div class="next-hint">扫描格号核对后确认实取数量；少取可改选同盘来源格或保留缺口。</div>' +
+      '</div></div>';
+  }
+  const groups = order.map((tid) => {
+    const tr = trayById(tid);
+    const ts = req.allocations.filter((a) => a.tray_id === tid
+      && a.status !== 'cancelled').sort((a, b) => a.seq - b.seq);
+    const sum = reqTraySummary(req, tid);
+    const isCur = tid === curTrayId && !gateId;
+    const isGate = tid === gateId;
+    return '<div class="tgroup' + (isCur ? ' cur' : isGate ? ' gate' : '') +
+      (sum.total === sum.done + sum.gap ? ' done' : '') + '">' +
+      '<div class="tg-head">' + (isGate ? '➡ ' : isCur ? '● ' : '○ ') +
+      '<b>' + esc(tr.name) + '</b> <span class="mono dim">' +
+      esc(tr.scan_code || '—') + '</span><span class="tg-prog">' +
+      (sum.done + sum.gap) + '/' + sum.total + '</span></div>' +
+      '<div class="tg-cells">' + ts.map((a) =>
+        '<span class="tg-cell st-' +
+        ({ done: 'done', active: 'active', gap: 'skipped' }[a.status] || 'pending') +
+        '" title="' + esc(a.cell_char) + ' 应取' + a.qty + ' 实取' +
+        a.taken_qty + '">' + esc(a.label) + (a.status === 'gap' ? '缺' : '') +
+        '</span>').join(' ') + '</div></div>';
+  }).join('');
+  return '<div class="run-layout"><div class="tray-wrap">' +
+    '<div class="tray-titlebar"><h2>领用：' + esc(curTray ? curTray.name : '') +
+    '</h2><span class="muted mono">' + esc(curTray ? curTray.scan_code : '') +
+    ' · 领用单 #' + req.id + '</span></div>' +
+    '<svg id="reqTray" class="tray" role="img" aria-label="领用当前字盘"></svg>' +
+    '<div class="legend"><span><i class="sw sw-cur"></i>当前来源格</span>' +
+    '<span><i class="sw sw-next"></i>盘内下一格</span>' +
+    '<span><i class="sw sw-done"></i>已取</span>' +
+    '<span><i class="sw sw-over"></i>缺口</span></div>' +
+    (gateId
+      ? '<div class="panel gate"><h3>请更换字盘并扫描字盘码</h3>' +
+        '<div class="gate-expect">预期字盘：<b>' + esc(trayById(gateId).name) +
+        '</b> <span class="mono">（' + esc(trayById(gateId).scan_code) + '）</span></div>' +
+        '<div class="scan-row"><input id="reqGateInput" autocomplete="off" ' +
+        'placeholder="扫描实体字盘上的字盘码后回车">' +
+        '<button id="btnReqGate" class="primary">确认换盘</button></div>' +
+        '<div id="reqGateMsg" class="gate-msg"></div></div>' : '') +
+    '</div><div class="run-side"><div class="panel">' +
+    '<div class="row between"><h2>领用单 #' + req.id + '</h2>' +
+    '<span class="muted">' + doneAllocs + '/' + totalAllocs + ' 格 · ' +
+    taken + '/' + total + ' 枚</span></div>' +
+    '<div class="progress"><div style="width:' +
+    (totalAllocs ? doneAllocs / totalAllocs * 100 : 0) +
+    '%;height:100%;background:var(--done)"></div></div>' + curCard +
+    '<div class="scan-row"><input id="reqScan" autocomplete="off" ' +
+    'placeholder="扫描 / 输入当前盘格号后回车" ' + (cur ? '' : 'disabled') + '>' +
+    '<input id="reqQty" type="number" min="1" placeholder="实取" ' +
+    (cur ? '' : 'disabled') + '></div>' +
+    '<div class="row"><button id="btnReqPick" class="primary" ' +
+    (cur ? '' : 'disabled') + '>确认实取</button>' +
+    '<button id="btnReqUndo">撤销上一笔</button></div>' +
+    '<div class="row"><button id="btnReqFinish" ' +
+    (gateId || cur ? 'disabled' : '') + '>完成领用</button>' +
+    '<button id="btnReqCancel" class="danger">取消领用单</button>' +
+    '<button id="btnReqPrint">打印</button></div>' +
+    '</div><div id="reqConflictBox"></div>' +
+    '<div class="panel"><h3>换盘与格位顺序</h3>' + groups + '</div></div></div>';
+}
+
+function bindReqActive(req) {
+  const gateInp = $('#reqGateInput');
+  if (gateInp) {
+    const doGate = () => guard(async () => {
+      const res = await api('/api/requisitions/' + req.id + '/confirm-tray',
+        'POST', { scan_code: gateInp.value.trim() });
+      if (res.ok) {
+        applyState(res.state);
+        toast('已确认换盘，请从高亮来源格开始');
+        const s = $('#reqScan'); if (s) s.focus();
+      } else {
+        reqTrayGate = res.conflict;
+        const msg = $('#reqGateMsg');
+        if (msg) msg.innerHTML = '<span class="diff-up">' +
+          esc(res.conflict.message) + '</span>';
+      }
+    });
+    $('#btnReqGate').onclick = doGate;
+    gateInp.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') doGate();
+    });
+    setTimeout(() => gateInp.focus(), 0);
+  }
+  const doPick = () => guard(async () => {
+    const qv = $('#reqQty').value;
+    const body = { label: $('#reqScan').value.trim() };
+    if (qv) body.qty = parseInt(qv, 10);
+    const res = await api('/api/requisitions/' + req.id + '/pick', 'POST', body);
+    if (res.ok) {
+      reqConflict = null;
+      $('#reqScan').value = '';
+      $('#reqQty').value = '';
+      applyState(res.state);
+      toast('已确认实取并扣减库存');
+    } else {
+      reqConflict = res.conflict;
+      applyState(res.state);
+    }
+  });
+  $('#btnReqPick').onclick = doPick;
+  $('#reqScan').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') doPick();
+  });
+  $('#reqQty').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') doPick();
+  });
+  $('#btnReqUndo').onclick = () => guard(async () => {
+    const res = await api('/api/requisitions/' + req.id + '/undo', 'POST');
+    applyState(res.state);
+    reqConflict = null;
+    toast('已撤销上一笔（库存已补回）');
+  });
+  $('#btnReqFinish').onclick = () => guard(async () => {
+    const res = await api('/api/requisitions/' + req.id + '/finish', 'POST');
+    applyState(res.state);
+    toast('领用单已完成');
+  });
+  $('#btnReqCancel').onclick = () => guard(async () => {
+    if (!confirm('取消领用单？未取预留将释放，已实取数量保留在记录中。')) return;
+    applyState((await api('/api/requisitions/' + req.id + '/cancel',
+      'POST')).state);
+    reqConflict = null;
+    toast('领用单已取消');
+  });
+  $('#btnReqPrint').onclick = () => printRequisition(reqById(req.id) || req);
+  renderReqConflict(req);
+}
+
+function drawReqTray(req) {
+  const svg = $('#reqTray');
+  if (!svg) return;
+  const cur = reqCurrentAlloc(req);
+  const gateId = reqGateTray(req);
+  const tid = cur ? cur.tray_id : (gateId || (reqOrder(req)[0]));
+  const byCell = {};
+  for (const a of req.allocations) {
+    if (a.tray_id === tid) byCell[a.cell_id] = a;
+  }
+  let nextId = null;
+  if (cur) {
+    const nxt = req.allocations.find((a) => a.tray_id === cur.tray_id
+      && a.status === 'reserved' && a.seq > cur.seq);
+    nextId = nxt ? nxt.cell_id : null;
+  }
+  drawTray(svg, tid ? trayCells(tid) : [], {
+    cls: (c) => {
+      const a = byCell[c.id];
+      if (cur && c.id === cur.cell_id) return 'cur';
+      if (c.id === nextId) return 'next';
+      if (a && a.status === 'done') return 'done';
+      if (a && a.status === 'gap') return 'over';
+      return '';
+    },
+    sub: (c) => {
+      const a = byCell[c.id];
+      if (!a) return null;
+      if (a.status === 'gap') return { text: '缺' + a.qty, cls: 'cell-sub-flag' };
+      if (a.status === 'done')
+        return { text: '取' + a.taken_qty, cls: 'cell-sub-up' };
+      return { text: '取' + a.qty, cls: 'cell-sub-down' };
+    },
+    onClick: (c) => {
+      const inp = $('#reqScan');
+      if (inp && !inp.disabled) { inp.value = c.label; $('#reqQty').focus(); }
+    },
+  });
+}
+
+/* ---- 领用冲突面板 ---- */
+
+function renderReqConflict(req) {
+  const box = $('#reqConflictBox');
+  if (!box) return;
+  if (!reqConflict) { box.innerHTML = ''; return; }
+  const c = reqConflict;
+  let html = '<div class="panel conflict"><h3>' + esc(c.message) + '</h3>';
+  if (c.type === 'short_pick' || c.type === 'short_avail') {
+    const a = c.allocation;
+    const opts = (c.candidates || []).map((k) =>
+      '<option value="' + k.id + '">' + esc(k.label) + '「' + esc(k.char) +
+      '」' + esc(k.font) + ' ' + esc(k.size) + ' · 可拿 ' + k.avail + '</option>')
+      .join('');
+    html += '<p>原来源格 <b>' + esc(a.label) + '</b>，应取 ' + a.remain +
+      ' 枚。确认前不扣库存。</p>' +
+      '<div class="row"><label>同盘另一来源格 <select id="reqCandSel">' +
+      (opts || '<option value="">无可用同规格格位</option>') + '</select></label>' +
+      '<label>原格实取 <input id="reqPicked" type="number" min="0" value="' +
+      (c.type === 'short_pick' ? c.picked : 0) + '" style="width:6rem"></label></div>' +
+      '<div class="row"><button id="btnReqChange" class="primary"' +
+      (!c.candidates.length ? ' disabled' : '') +
+      '>改选来源格（新格余量继续扫码确认）</button>' +
+      '<button id="btnReqGap">保留差额为缺口</button>' +
+      '<button id="btnReqConflictCancel">取消，重新扫描</button></div>';
+  } else if (c.type === 'mismatch') {
+    html += '<div class="compare">' +
+      cellBox('应取来源格', {
+        label: c.expected.label, char: c.expected.char, font: c.expected.font,
+        size: c.expected.size, qty: c.expected.qty, capacity: 0,
+        x: 0, y: 0,
+      }) + '<div class="arrow">≠</div>' + cellBox('扫描到', {
+        label: c.scanned.label, char: c.scanned.char, font: c.scanned.font,
+        size: c.scanned.size, qty: c.scanned.qty,
+        capacity: c.scanned.capacity, x: c.scanned.x, y: c.scanned.y,
+      }) + '</div>';
+    if (c.same_spec) {
+      html += '<p class="diff-ok">扫描格与应取格同规格（' + esc(c.scanned.char) +
+        ' ' + esc(c.scanned.font) + ' ' + esc(c.scanned.size) + '），可改选为来源格。</p>' +
+        '<div class="row"><button id="btnReqUseScanned" class="primary">以「' +
+        esc(c.scanned.label) + '」为来源格继续</button>' +
+        '<button id="btnReqConflictCancel">取消，重新核对</button></div>';
+    } else {
+      html += '<p class="diff-up">规格 / 字种不符，系统不会自动替换；请重新核对实物后扫描。</p>' +
+        '<div class="row"><button id="btnReqConflictCancel">取消，重新扫描</button></div>';
+    }
+  } else if (c.type === 'tray_mismatch') {
+    html += '<div class="compare">' + trayBox('预期字盘', c.expected) +
+      '<div class="arrow">≠</div>' + trayBox('实际扫到', c.scanned) + '</div>' +
+      '<div class="row"><button id="btnReqConflictCancel">知道了，重新换盘</button></div>';
+  } else if (c.type === 'tray_unknown') {
+    html += '<div class="compare">' + trayBox('预期字盘', c.expected) +
+      '<div class="arrow">?</div><div class="box"><h4>实际扫描</h4>' +
+      '<span class="mono">' + esc(c.scanned_code) + '</span><br>没有字盘使用该码</div></div>' +
+      '<div class="row"><button id="btnReqConflictCancel">知道了，重新扫描</button></div>';
+  } else {
+    html += '<div class="row"><button id="btnReqConflictCancel">知道了，重新扫描</button></div>';
+  }
+  html += '</div>';
+  box.innerHTML = html;
+
+  const cancel = $('#btnReqConflictCancel');
+  if (cancel) cancel.onclick = () => { reqConflict = null; renderReqConflict(req); };
+  const change = $('#btnReqChange');
+  if (change) change.onclick = () => guard(async () => {
+    const cid = parseInt($('#reqCandSel').value, 10);
+    if (!cid) return;
+    const picked = parseInt($('#reqPicked').value, 10) || 0;
+    const res = await api('/api/requisitions/' + req.id + '/change-source',
+      'POST', { cell_id: cid, picked });
+    applyState(res.state);
+    reqConflict = null;
+    toast('已改选来源格，请在新格扫码确认实取');
+  });
+  const gap = $('#btnReqGap');
+  if (gap) gap.onclick = () => guard(async () => {
+    const picked = parseInt($('#reqPicked') && $('#reqPicked').value, 10) || 0;
+    const a = reqConflict.allocation;
+    const res = await api('/api/requisitions/' + req.id + '/keep-gap',
+      'POST', { allocation_id: a.id, picked });
+    applyState(res.state);
+    reqConflict = null;
+    toast('差额已保留为缺口');
+  });
+  const useScanned = $('#btnReqUseScanned');
+  if (useScanned) useScanned.onclick = () => guard(async () => {
+    const sc = reqConflict.scanned;
+    const res = await api('/api/requisitions/' + req.id + '/change-source',
+      'POST', { cell_id: sc.id, picked: 0 });
+    applyState(res.state);
+    reqConflict = null;
+    toast('已改选「' + sc.label + '」为来源格，请扫码确认实取');
+  });
+}
+
+/* ---- 历史记录 ---- */
+
+function renderReqHistory() {
+  const el = $('#reqHistory');
+  if (!el) return;
+  const hist = S.req_history || [];
+  if (!hist.length) {
+    el.innerHTML = '<p class="hint">暂无已结束的领用单。</p>';
+    return;
+  }
+  el.innerHTML = '<table class="tasks"><thead><tr><th>#</th><th>名称</th><th>状态</th>' +
+    '<th>来源格</th><th>预留</th><th>实取</th><th>缺口</th><th>创建</th><th></th></tr></thead><tbody>' +
+    hist.map((r) =>
+      '<tr><td>' + r.id + '</td><td>' + esc(r.name) + '</td><td>' +
+      (S.req_status_names[r.status] || r.status) + '</td><td>' + r.n_allocs +
+      '</td><td>' + r.qty_reserved + '</td><td>' + r.qty_taken + '</td><td>' +
+      (r.n_gap ? '<span class="diff-up">' + r.n_gap + '</span>' : '—') +
+      '</td><td class="muted">' + esc(r.created_at) + '</td><td>' +
+      '<button data-req-open="' + r.id + '">查看</button> ' +
+      '<button data-req-print="' + r.id + '">打印</button>' +
+      (r.status === 'done' && !r.returned_session_id
+        ? ' <button class="ok" data-req-return="' + r.id + '">带入归还</button>'
+        : r.returned_session_id
+          ? ' <span class="muted">已带批次#' + r.returned_session_id + '</span>' : '') +
+      '</td></tr>').join('') + '</tbody></table>';
+  el.querySelectorAll('[data-req-open]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      const res = await api('/api/requisitions/' + b.dataset.reqOpen);
+      printRequisition(res.requisition);
+    });
+  });
+  el.querySelectorAll('[data-req-print]').forEach((b) => {
+    b.onclick = () => guard(async () => {
+      const res = await api('/api/requisitions/' + b.dataset.reqPrint);
+      printRequisition(res.requisition);
+    });
+  });
+  el.querySelectorAll('[data-req-return]').forEach((b) => {
+    b.onclick = () => reqToReturn(parseInt(b.dataset.reqReturn, 10));
+  });
+}
+
+async function reqToReturn(rid) {
+  await guard(async () => {
+    const res = await api('/api/requisitions/' + rid + '/to-return', 'POST');
+    applyState(res.state);
+    toast('已生成归还批次 #' + res.session_id + '，请在「归还作业」页逐格扫码确认');
+    switchView('run');
+  });
+}
+
+/* ---- 打印领用单 / 标签 ---- */
+
+function printRequisition(req) {
+  if (!req) { toast('没有可打印的领用单', true); return; }
+  const stName = S.req_status_names[req.status] || req.status;
+  const order = reqOrder(req);
+  const demandRows = req.demands.map((dm) => {
+    const p = reqDemandProgress(req, dm);
+    return '<tr><td>' + esc(dm.char) + '</td><td>' + esc(dm.font || '任意') +
+      ' / ' + esc(dm.size || '任意') + '</td><td>' + dm.qty + '</td><td>' +
+      p.reserved + '</td><td>' + (p.taken || 0) + '</td><td>' +
+      (p.gap ? '<b>' + p.gap + '</b>' : '—') + '</td><td>' +
+      esc(dm.issue_text || (p.taken >= dm.qty ? '已领齐' : '')) + '</td></tr>';
+  }).join('');
+  const cards = [];
+  for (const tid of order) {
+    const tr = trayById(tid) || { name: '?', scan_code: '?' };
+    const allocs = req.allocations.filter((a) => a.tray_id === tid
+      && a.status !== 'cancelled').sort((a, b) => a.seq - b.seq);
+    allocs.forEach((a) => {
+      if (a.status === 'gap') return;  // 缺口不印取字标签
+      cards.push(
+        '<div class="label-card"><div class="lc-head"><span>字盘 <b>' +
+        esc(tr.name) + '</b></span><span class="mono">' + esc(tr.scan_code || '—') +
+        '</span></div><div class="lc-code">来源格 <b>' + esc(a.label) +
+        '</b> · 盘内 #' + a.seq + '</div><div class="lc-char">' +
+        esc(a.cell_char) + '</div><div class="lc-meta">' +
+        esc(a.cell_font || '—') + ' · ' + esc(a.cell_size || '—') +
+        '<br>预留 <b>' + a.qty + '</b> · 实取 ____' +
+        '<br>领用单 #' + req.id + '　' + esc(req.created_at) + '</div></div>');
+    });
+  }
+  const sourceRows = order.map((tid) => {
+    const tr = trayById(tid) || { name: '?', scan_code: '?' };
+    return req.allocations.filter((a) => a.tray_id === tid
+      && a.status !== 'cancelled').sort((a, b) => a.seq - b.seq).map((a) =>
+      '<tr><td>' + esc(tr.name) + '</td><td class="mono">' + esc(tr.scan_code || '—') +
+      '</td><td>' + esc(a.label) + '</td><td>' + esc(a.cell_char) + '</td><td>' +
+      esc(a.cell_font || '—') + ' / ' + esc(a.cell_size || '—') + '</td><td>' +
+      a.qty + '</td><td><b>' + a.taken_qty + '</b></td><td>' +
+      (a.status === 'gap' ? '<b>缺口 ' + a.qty + '</b>'
+        : S.alloc_status_names[a.status] || a.status) + '</td></tr>').join('');
+  }).join('');
+  const takenTotal = req.allocations.reduce((a, x) => a + x.taken_qty, 0);
+  const gapTotal = req.allocations.filter((a) => a.status === 'gap')
+    .reduce((a, x) => a + x.qty, 0);
+  $('#printArea').innerHTML =
+    '<div class="stock-sheet req-sheet"><h2>配字领用清单</h2>' +
+    '<p>领用单 <b>#' + req.id + '</b>　' + esc(req.name) + '　状态：' + stName +
+    '　创建：' + esc(req.created_at) +
+    (req.finished_at ? '　完成：' + esc(req.finished_at) : '') + '<br>' +
+    '实取合计 <b>' + takenTotal + '</b> 枚' +
+    (gapTotal ? '　<span class="diff-up">缺口合计 ' + gapTotal + ' 枚</span>' : '') +
+    '</p><h3>需求汇总</h3><table><thead><tr><th>字符</th><th>规格</th>' +
+    '<th>需求</th><th>预留</th><th>实取</th><th>缺口</th><th>备注</th>' +
+    '</tr></thead><tbody>' + demandRows + '</tbody></table>' +
+    '<h3>来源格明细（按字盘与盘内路线）</h3><table><thead><tr><th>字盘</th>' +
+    '<th>字盘码</th><th>格号</th><th>字符</th><th>规格</th><th>预留</th>' +
+    '<th>实取</th><th>状态</th></tr></thead><tbody>' + sourceRows + '</tbody></table>' +
+    '<p class="sign">领用人：____________　复核人：____________　日期：____________</p>' +
+    '<h3 class="page-break">来源格标签（裁剪后贴盘）</h3>' +
+    '<div class="label-grid">' + cards.join('') + '</div></div>';
+  window.print();
+}
+
 /* ---------------- 总渲染 ---------------- */
 
 function renderAll() {
@@ -1814,6 +2518,7 @@ function renderAll() {
   renderPending();
   renderData();
   renderStock();
+  renderPick();
 }
 
 function main() {

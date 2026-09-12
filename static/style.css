@@ -311,3 +311,5 @@ ul.stock-errors li { font-size: .85rem; }
 .stock-sheet table { width: 100%; border-collapse: collapse; margin: 3mm 0; }
 .stock-sheet th, .stock-sheet td { border: 1px solid #000; padding: 1.5mm 2mm; text-align: left; }
 .stock-sheet .sign { margin-top: 8mm; font-size: 10pt; }
+.stock-sheet h3.page-break { page-break-before: always; padding-top: 6mm; }
+.stock-sheet .label-grid { margin-top: 3mm; }
