@@ -210,6 +210,8 @@ CREATE TABLE IF NOT EXISTS req_allocations (
   qty INTEGER NOT NULL,                   -- 锁定时在该格的预留 / 应取数量
   taken_qty INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'reserved', -- reserved / active / done / gap / cancelled
+  kind TEXT NOT NULL DEFAULT 'plan',      -- plan（锁定时计划）/ change（改选）/ gap（缺口）
+  parent_id INTEGER,                      -- change/gap 行对应的父分配
   seq INTEGER NOT NULL DEFAULT 0,         -- 盘内路线次序
   created_at TEXT NOT NULL
 );
@@ -1560,18 +1562,67 @@ def _load_requisition(r):
     held = _hold_map(d["id"])
     for a in d["allocations"]:
         a["avail_other"] = max(0, a["cell_qty"] - held.get(a["cell_id"], 0))
+    d["totals"] = _req_totals(d["allocations"])
+    # 每条需求的计划预留 / 改选追加 / 实取 / 缺口（汇总只计 plan 行，
+    # change 与 gap 子行不与父计划行重复相加）
+    per_demand = {}
+    for a in d["allocations"]:
+        if a["status"] == "cancelled":
+            continue
+        x = per_demand.setdefault(a["demand_id"], {
+            "plan": 0, "change": 0, "gap": 0, "taken": 0,
+            "plan_left": 0})
+        kind = a["kind"] if a["kind"] in ("plan", "change", "gap") else "plan"
+        x[kind] += a["qty"]
+        x["taken"] += a["taken_qty"]
+        # 计划行已取消 / 缺口之外仍未取的数量（整格未取也计入最终缺口）
+        if kind == "plan" and a["status"] != "done":
+            x["plan_left"] += a["qty"] - a["taken_qty"]
+    for dm in d["demands"]:
+        x = per_demand.get(dm["id"], {"plan": 0, "change": 0, "gap": 0,
+                                      "taken": 0, "plan_left": 0})
+        dm["plan_qty"] = x["plan"]
+        dm["change_qty"] = x["change"]
+        dm["gap_qty"] = x["gap"]
+        dm["taken_qty"] = x["taken"]
+        # 最终缺口 = 规划时就配不齐的部分 + 执行中保留的 gap 子行
+        # + 计划行 / 改选行未落实的余量
+        dm["gap_total"] = (max(0, dm["qty"] - x["plan"]) + x["gap"]
+                           + x["plan_left"])
     return d
+
+
+def _req_totals(allocs):
+    """领用单数量汇总（避免父计划行与改选 / 缺口子行重复相加）。"""
+    plan = change = gap = taken = 0
+    for a in allocs:
+        if a["status"] == "cancelled":
+            continue
+        if a["kind"] == "gap" or a["status"] == "gap":
+            gap += a["qty"]
+        elif a["kind"] == "change":
+            change += a["qty"]
+        else:
+            plan += a["qty"]
+        taken += a["taken_qty"]
+    return {"plan_qty": plan, "change_qty": change, "gap_qty": gap,
+            "taken_qty": taken, "reserved_qty": plan + change}
 
 
 def _req_brief(r):
     d = dict(r)
     d["tray_order"] = _loads(d.get("tray_order") or "[]")
-    n = row("SELECT COUNT(*) AS n, COALESCE(SUM(qty),0) AS q, "
-            "COALESCE(SUM(taken_qty),0) AS t FROM req_allocations "
-            "WHERE req_id=?", (r["id"],))
+    n = row("SELECT COUNT(*) AS n FROM req_allocations WHERE req_id=?",
+            (r["id"],))
     d["n_allocs"] = n["n"]
-    d["qty_reserved"] = n["q"]
-    d["qty_taken"] = n["t"]
+    # 预留合计只计 plan + change（缺口与已取消行不占库存，也不与父行重复相加）
+    tot = row(
+        "SELECT COALESCE(SUM(CASE WHEN kind IN ('plan','change') "
+        "AND status!='cancelled' THEN qty ELSE 0 END),0) AS r, "
+        "COALESCE(SUM(taken_qty),0) AS t FROM req_allocations "
+        "WHERE req_id=?", (r["id"],))
+    d["qty_reserved"] = tot["r"]
+    d["qty_taken"] = tot["t"]
     d["n_gap"] = row("SELECT COUNT(*) AS n FROM req_allocations "
                      "WHERE req_id=? AND status='gap'", (r["id"],))["n"]
     d["n_issue_demands"] = row(
@@ -1638,10 +1689,13 @@ def _req_candidates(alloc, exclude_cell_id, limit=8):
     （改选进来会与之叠加，不能重复拿同一批铅字）。
     """
     out = []
+    # 本单在每格上“尚未落实”的预留（计划行 + 改选子行，未完成 / 未缺口）：
+    # 这些实物已在盘内路线上被本单占用，不能再作为改选来源重复拿
     same_req_reserved = {r["cell_id"]: r["n"] for r in rows(
         "SELECT cell_id, COALESCE(SUM(qty-taken_qty),0) AS n "
-        "FROM req_allocations WHERE req_id=? AND status='reserved' "
-        "GROUP BY cell_id", (alloc["req_id"],))}
+        "FROM req_allocations WHERE req_id=? "
+        "AND status IN ('reserved','active') GROUP BY cell_id",
+        (alloc["req_id"],))}
     held = _hold_map(alloc["req_id"])
     for c in rows(
             "SELECT * FROM cells WHERE tray_id=? AND id!=? AND char=? "
@@ -1874,24 +1928,18 @@ def change_req_source(rid, body):
         raise ApiError("差额为 0：无需改选，直接确认实取即可")
     # 目标格可用量排除旧来源格（即将完成）；若该格在本单已有预留（exist），
     # 余量并入后会与之叠加，合并后总量不能超过该格实际可拿量
-    exist = row("SELECT * FROM req_allocations WHERE req_id=? AND cell_id=? "
-                "AND id!=? AND status='reserved' ORDER BY seq LIMIT 1",
-                (rid, new["id"], alloc["id"]))
-    # 可用实物 = 当前存量 − 其他领用单预留；本单在该格的其他预留是本单自己
-    # 要取的量，先加回，随后按是否并入 exist 统一校验叠加后的总量
+    # 新格在本单已有的预留（计划行 + 尚未处理的改选子行）也要占用实物库存：
+    # 余量必须是“额外可拿”的量，不能与既有预留重复
     same_req_held = row(
         "SELECT COALESCE(SUM(qty-taken_qty),0) AS n FROM req_allocations "
-        "WHERE req_id=? AND cell_id=? AND id!=? AND status='reserved'",
+        "WHERE req_id=? AND cell_id=? AND id!=? AND kind IN ('plan','change') "
+        "AND status IN ('reserved','active')",
         (rid, new["id"], alloc["id"]))["n"]
     other_held = _held_on_cell(new["id"]) - same_req_held
-    avail = max(0, new["qty"] - other_held)
-    if exist:
-        if exist["qty"] - exist["taken_qty"] + qnew > avail:
-            raise ApiError("格 %s 可用数量不足 %d 枚（含本单已预留 %d 枚）"
-                           % (new["label"], qnew,
-                              exist["qty"] - exist["taken_qty"]))
-    elif avail < qnew:
-        raise ApiError("格 %s 可用数量不足 %d 枚" % (new["label"], qnew))
+    avail = max(0, new["qty"] - other_held) - same_req_held
+    if avail < qnew:
+        raise ApiError("格 %s 可用数量不足 %d 枚（含本单已预留 %d 枚）"
+                       % (new["label"], qnew, same_req_held))
     old_cell = row("SELECT * FROM cells WHERE id=?", (alloc["cell_id"],))
     if old_cell["qty"] < picked:
         raise ApiError("原格实际存量仅 %d 枚，实取数量不符" % old_cell["qty"])
@@ -1901,26 +1949,22 @@ def change_req_source(rid, body):
                    (picked, old_cell["id"]))
     db.execute("UPDATE req_allocations SET taken_qty=taken_qty+?, status='done' "
                "WHERE id=?", (picked, alloc["id"]))
-    if exist:
-        # 余量并入同规格同格的既有预留：提前激活，路线上只来访一次
-        db.execute("UPDATE req_allocations SET qty=qty+?, status='active' "
-                   "WHERE id=?", (qnew, exist["id"]))
-        new_id = exist["id"]
-    else:
-        cur2 = db.execute(
-            "INSERT INTO req_allocations(req_id,demand_id,tray_id,cell_id,qty,"
-            "taken_qty,status,seq,created_at) VALUES(?,?,?,?,?,0, 'active', ?,?)",
-            (rid, alloc["demand_id"], alloc["tray_id"], new["id"], qnew,
-             alloc["seq"], ts))
-        new_id = cur2.lastrowid
+    # 始终单列一笔“改选”子分配：父计划行 qty 不变，预留合计不会被重复相加
+    cur2 = db.execute(
+        "INSERT INTO req_allocations(req_id,demand_id,tray_id,cell_id,qty,"
+        "taken_qty,status,kind,parent_id,seq,created_at) "
+        "VALUES(?,?,?,?,?,0, 'active', 'change', ?, ?,?)",
+        (rid, alloc["demand_id"], alloc["tray_id"], new["id"], qnew,
+         alloc["id"], alloc["seq"], ts))
+    new_id = cur2.lastrowid
     db.execute(
         "INSERT INTO req_issues(req_id,allocation_id,kind,cell_id,tray_id,qty,"
         "payload,created_at) VALUES(?,?, 'change', ?,?,?,?,?)",
         (rid, alloc["id"], new["id"], alloc["tray_id"], qnew,
          json.dumps({"old_allocation_id": alloc["id"],
                      "new_allocation_id": new_id, "old_cell_id": alloc["cell_id"],
-                     "new_cell_id": new["id"], "picked": picked, "qty": qnew,
-                     "merged": bool(exist)}, ensure_ascii=False), ts))
+                     "new_cell_id": new["id"], "picked": picked, "qty": qnew},
+                    ensure_ascii=False), ts))
     return {"ok": True, "new_allocation_id": new_id, "state": get_state()}
 
 
@@ -1956,9 +2000,10 @@ def keep_req_gap(rid, body):
                "WHERE id=?", (picked, alloc["id"]))
     cur = db.execute(
         "INSERT INTO req_allocations(req_id,demand_id,tray_id,cell_id,qty,"
-        "taken_qty,status,seq,created_at) VALUES(?,?,?,?,?,0, 'gap', ?,?)",
+        "taken_qty,status,kind,parent_id,seq,created_at) "
+        "VALUES(?,?,?,?,?,0, 'gap', 'gap', ?, ?,?)",
         (rid, alloc["demand_id"], alloc["tray_id"], alloc["cell_id"], gap_n,
-         alloc["seq"], ts))
+         alloc["id"], alloc["seq"], ts))
     gap_id = cur.lastrowid
     db.execute(
         "INSERT INTO req_issues(req_id,allocation_id,kind,cell_id,tray_id,qty,"
@@ -2011,19 +2056,14 @@ def undo_requisition(rid):
                 db.execute("UPDATE cells SET qty=qty+? WHERE id=?",
                            (picked, parent["cell_id"]))
     elif last["kind"] == "change":
-        new_id = payload.get("new_allocation_id")
-        new_a = row("SELECT * FROM req_allocations WHERE id=?", (new_id,))
+        new_a = row("SELECT * FROM req_allocations WHERE id=?",
+                    (payload.get("new_allocation_id"),))
         parent = row("SELECT * FROM req_allocations WHERE id=?",
                      (payload.get("old_allocation_id"),))
         picked = int(payload.get("picked") or 0)
+        # 改选子行始终单列，直接删除；父计划行恢复为当前格
         if new_a:
-            if payload.get("merged"):
-                # 余量并入的是既有预留：拆回预留量与状态，不删除该分配
-                db.execute("UPDATE req_allocations SET status='reserved', "
-                           "qty=max(qty-?,0), taken_qty=0 WHERE id=?",
-                           (last["qty"], new_a["id"]))
-            else:
-                db.execute("DELETE FROM req_allocations WHERE id=?", (new_a["id"],))
+            db.execute("DELETE FROM req_allocations WHERE id=?", (new_a["id"],))
         if parent:
             db.execute("UPDATE req_allocations SET status='active', "
                        "taken_qty=max(taken_qty-?,0) WHERE id=?",
@@ -3013,10 +3053,46 @@ def _migrate():
                "AND locked=0")
 
 
+def _migrate_req_allocations():
+    """旧库补 kind / parent_id 列；执行中改选 / 缺口子行与父行区分开。"""
+    cols = {r["name"] for r in db.execute(
+        "PRAGMA table_info(req_allocations)")}
+    if not cols:
+        return
+    if "kind" not in cols:
+        db.execute("ALTER TABLE req_allocations ADD COLUMN kind TEXT "
+                   "NOT NULL DEFAULT 'plan'")
+    if "parent_id" not in cols:
+        db.execute("ALTER TABLE req_allocations ADD COLUMN parent_id INTEGER")
+    # status='gap' 的行必然是缺口子行；plan 行上的改选 / 缺口记录写入 parent_id
+    db.execute("UPDATE req_allocations SET kind='gap' WHERE status='gap' "
+               "AND kind='plan'")
+    # 用 req_issues 回填 change 子行的 kind 与 parent_id
+    for i in rows("SELECT * FROM req_issues WHERE kind='change'"):
+        try:
+            p = json.loads(i["payload"] or "{}")
+        except ValueError:
+            continue
+        nid, pid = p.get("new_allocation_id"), p.get("old_allocation_id")
+        if nid:
+            db.execute("UPDATE req_allocations SET kind='change', parent_id=? "
+                       "WHERE id=?", (pid, nid))
+    for i in rows("SELECT * FROM req_issues WHERE kind='gap'"):
+        try:
+            p = json.loads(i["payload"] or "{}")
+        except ValueError:
+            continue
+        pid = p.get("parent_allocation_id")
+        if pid:
+            db.execute("UPDATE req_allocations SET parent_id=? WHERE id=? "
+                       "AND parent_id IS NULL", (pid, i["allocation_id"]))
+
+
 def init_db():
     with DB_LOCK:
         db.executescript(SCHEMA)
         _migrate()
+        _migrate_req_allocations()
         # 修复既有空 / 重复扫描码后，再建立全局唯一索引兜底
         normalize_scan_codes()
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trays_scan_code "

@@ -992,29 +992,26 @@ def run_tests():
     print("== 26. 配字领用：汇总 / 多盘分配 / 预留互斥 / 扫码取字 ==")
     code, st = call("GET", "/api/state")
     t0 = st["trays"][0]
+    # 用专用字种「铜」做分配（其他测试不会产生该字，保证贪心结果确定）；
+    # 「永」仅用来核对种子盘上的既有数据不受影响
     f4 = next((c for c in st["cells"] if c["char"] == "永"
                and c["tray_id"] == t0["id"]), None)
-    if f4 is None:
-        slot = next((c for c in st["cells"] if c["tray_id"] == t0["id"]
-                     and not c["char"]), st["cells"][0])
-        call("PUT", "/api/cells/%d" % slot["id"],
-             {"char": "永", "font": "宋体", "size": "五号"})
-        f4 = dict(slot, char="永")
-    call("PUT", "/api/cells/%d" % f4["id"], {"qty": 21})
-    f4["qty"] = 21
-    # 新字盘：同规格两格 + 异体字格 + 一个不参与分配的备用格
+    # 两个新字盘：专用字种「铜」分散在两盘 + 异体 / 异规格 / 备用格
     code, res = call("POST", "/api/trays",
-                     {"name": "领用备盘", "scan_code": "TRAY-R2"})
-    tr2 = res["tray_id"]
-    for lab, ch, font, size, q in (
-            ("R1", "永", "宋体", "五号", 6),
-            ("R2", "永", "宋体", "五号", 4),
-            ("R3", "體", "宋体", "五号", 5),
-            ("R4", "永", "宋体", "五号", 0)):
-        call("POST", "/api/cells", {"tray_id": tr2, "label": lab, "char": ch,
-                                    "font": font, "size": size, "qty": q})
-    r1 = next(c for c in call("GET", "/api/state")[1]["cells"]
-              if c["tray_id"] == tr2 and c["label"] == "R1")
+                     {"name": "领用铜盘A", "scan_code": "TRAY-RA"})
+    tra = res["tray_id"]
+    code, res = call("POST", "/api/trays",
+                     {"name": "领用铜盘B", "scan_code": "TRAY-RB"})
+    trb = res["tray_id"]
+    for tray, lab, ch, q in (
+            (tra, "A1", "铜", 10),
+            (tra, "A2", "铜", 0),
+            (tra, "A4", "体", 3),
+            (trb, "B1", "铜", 6),
+            (trb, "B2", "铜", 4),
+            (trb, "B3", "铜", 0)):
+        call("POST", "/api/cells", {"tray_id": tray, "label": lab, "char": ch,
+                                    "font": "宋体", "size": "五号", "qty": q})
 
     # 文字模式：逐字汇总；标点 / 空格可分别排除（逗号不计入、空格不计入）
     code, res = call("POST", "/api/requisitions",
@@ -1040,80 +1037,83 @@ def run_tests():
     check("待锁定领用单可取消并释放预留", True)
 
     # 清单模式：数量不足 / 仅有异体字 / 规格不符分别列出，不自动替换
-    # 需求 25：F4(21) + R4(4) 贪心配满；R1/R2 留给后续预留互斥验证
+    # 专用字种「铜」：A 盘 10 + B 盘 B1(6)+B2(4) = 20；需求 25 → 缺口 5
     code, res = call("POST", "/api/requisitions",
-                     {"text": "永,25,宋体,五号\n體,2\n永,5,黑体,五号",
+                     {"text": "铜,25,宋体,五号\n體,2\n铜,5,黑体,五号",
                       "mode": "list"})
     rid = res["requisition_id"]
     req = call("GET", "/api/requisitions/%d" % rid)[1]["requisition"]
     issues = {(d["char"], d["font"], d["size"]): d for d in req["demands"]}
-    check("数量不足单列", issues[("永", "宋体", "五号")]["issue"] == "short"
-          and issues[("永", "宋体", "五号")]["qty"] == 25,
+    check("数量不足单列",
+          issues[("铜", "宋体", "五号")]["issue"] == "short"
+          and issues[("铜", "宋体", "五号")]["qty"] == 25,
           str([(d["char"], d["font"], d["issue"]) for d in req["demands"]]))
-    check("异体字单列不替换", issues[("體", "", "")]["issue"] == "variant",
+    check("异体字单列不替换",
+          issues[("體", "", "")]["issue"] == "variant"
+          and any(a["cell_char"] == "体" for a in req["allocations"]) is False,
           str([(d["char"], d["issue"]) for d in req["demands"]]))
     check("规格不符单列不替换",
-          issues[("永", "黑体", "五号")]["issue"] == "spec")
-    yong_allocs = [a for a in req["allocations"] if a["cell_char"] == "永"]
+          issues[("铜", "黑体", "五号")]["issue"] == "spec")
+    tong_allocs = [a for a in req["allocations"] if a["cell_char"] == "铜"]
     check("从多个字盘同规格格位分配且不自动替换异规格",
-          sum(a["qty"] for a in yong_allocs) == 25
-          and {a["tray_id"] for a in yong_allocs} == {t0["id"], tr2},
-          str([(a["label"], a["qty"]) for a in yong_allocs]))
-    tray2_yong = {a["label"]: a["qty"] for a in yong_allocs
-                  if a["tray_id"] == tr2}
-    check("贪心优先大容量格（R1=6 先于 R2=4）",
-          "R1" in tray2_yong)
+          sum(a["qty"] for a in tong_allocs) == 20
+          and {a["tray_id"] for a in tong_allocs} == {tra, trb},
+          str([(a["label"], a["qty"]) for a in tong_allocs]))
+    trb_tong = {a["label"]: a["qty"] for a in tong_allocs
+                if a["tray_id"] == trb}
+    check("贪心优先大容量格（B1=6 先于 B2=4）", "B1" in trb_tong)
     order = req["tray_order"]
-    check("换盘路线按字盘归组", set(order) == {t0["id"], tr2})
+    check("换盘路线按字盘归组", set(order) == {tra, trb})
 
-    # 预留互斥：第二张领用单只能看到扣除预留后的余量
-    # 本领用单未占用的格位 = R1..R4 中未分配的那些
-    used_ids = {a["cell_id"] for a in req["allocations"]}
-    free = {c["label"]: c["qty"] for c in call("GET", "/api/state")[1]["cells"]
-            if c["tray_id"] == tr2 and c["id"] not in used_ids
-            and c["char"] == "永"}
-    free_total = sum(free.values())
+    # 预留互斥：20 枚已被本领用单全部预留；第二张无可用量
     code, res = call("POST", "/api/requisitions",
-                     {"text": "永,%d" % (free_total + 3), "mode": "list"})
+                     {"text": "铜,3", "mode": "list"})
     rid2 = res["requisition_id"]
     req2 = call("GET", "/api/requisitions/%d" % rid2)[1]["requisition"]
-    check("扣除其他未完成领用单的预留量",
-          all(a["cell_id"] != f4["id"] for a in req2["allocations"])
-          and sum(a["qty"] for a in req2["allocations"]) == free_total
-          and set(free) >= {a["label"] for a in req2["allocations"]}
+    check("扣除其他未完成领用单的预留量（无余量时不再分配）",
+          not req2["allocations"]
           and any(d["issue"] == "short" for d in req2["demands"]),
           str([(a["label"], a["qty"]) for a in req2["allocations"]]))
     call("POST", "/api/requisitions/%d/cancel" % rid2, {})
 
-    # R4 补库存（本领用单未占用），供后续少取改选来源格使用
-    r4_cell = next(c for c in call("GET", "/api/state")[1]["cells"]
-                   if c["tray_id"] == tr2 and c["label"] == "R4")
-    call("PUT", "/api/cells/%d" % r4_cell["id"], {"qty": 8})
+    # B3 补库存（本领用单未预留），供后续少取改选来源格使用
+    b3_cell = next(c for c in call("GET", "/api/state")[1]["cells"]
+                   if c["tray_id"] == trb and c["label"] == "B3")
+    call("PUT", "/api/cells/%d" % b3_cell["id"], {"qty": 8})
+
+    # 实际换盘顺序由贪心 / 蛇形决定（字盘显示顺序），按状态动态取码
+    trays_by_id = {t["id"]: t for t in call("GET", "/api/state")[1]["trays"]}
 
     # 锁定与换盘闸门
     code, res = call("POST", "/api/requisitions/%d/plan" % rid, {"lock": True})
     check("可锁定来源格", res.get("ok"), str(res)[:200])
+    first_tray = order[0]
+    # 起始盘也必须先扫字盘码；先验证拦截
     code, res = call("POST", "/api/requisitions/%d/pick" % rid,
-                     {"label": "R1"})
+                     {"label": "B1"})
     check("未扫字盘码不能取字", code == 400)
     code, res = call("POST", "/api/requisitions/%d/confirm-tray" % rid,
                      {"scan_code": "NOPE"})
     check("扫错字盘码拦截",
           res["conflict"]["type"] == "tray_unknown")
+    other_code = "TRAY-RB" if first_tray == tra else "TRAY-RA"
     code, res = call("POST", "/api/requisitions/%d/confirm-tray" % rid,
-                     {"scan_code": "TRAY-R2"})
+                     {"scan_code": other_code})
     check("换错盘暂停对照", res["conflict"]["type"] == "tray_mismatch")
     code, res = call("POST", "/api/requisitions/%d/confirm-tray" % rid,
-                     {"scan_code": "TRAY-01"})
+                     {"scan_code": trays_by_id[first_tray]["scan_code"]})
     check("扫正确字盘码后激活首格", res.get("ok")
           and any(a["status"] == "active"
                   for a in res["state"]["requisition"]["allocations"]))
     req = res["state"]["requisition"]
     cur = next(a for a in req["allocations"] if a["status"] == "active")
+    first_cell_label = cur["label"]
     qty_before = next(c for c in res["state"]["cells"]
                       if c["id"] == cur["cell_id"])["qty"]
+    # 扫别的盘的格号应被拒
+    foreign_label = "A1" if cur["tray_id"] == trb else "B1"
     code, res = call("POST", "/api/requisitions/%d/pick" % rid,
-                     {"label": "R1"})
+                     {"label": foreign_label})
     check("格号只认当前字盘", res["conflict"]["type"] == "wrong_tray")
     code, res = call("POST", "/api/requisitions/%d/pick" % rid,
                      {"label": cur["label"], "qty": cur["qty"]})
@@ -1121,14 +1121,32 @@ def run_tests():
           and next(c for c in res["state"]["cells"]
                    if c["id"] == cur["cell_id"])["qty"]
           == qty_before - cur["qty"], str(res)[:200])
+    # 完成首盘全部格位（首盘可能有多格），再验证停在换盘闸门
+    for _ in range(6):
+        req = res["state"]["requisition"]
+        act = next((a for a in req["allocations"]
+                    if a["status"] == "active"), None)
+        if act is None:
+            break
+        code, res = call("POST", "/api/requisitions/%d/pick" % rid,
+                         {"label": act["label"], "qty": act["qty"]})
+        if not res.get("ok"):
+            check("首盘逐格全取", False, str(res)[:150])
+            break
     check("首盘做完停在换盘闸门",
           not any(a["status"] == "active"
                   for a in res["state"]["requisition"]["allocations"]))
+    # 找到下一个还有预留的字盘并扫码
+    req = res["state"]["requisition"]
+    pending_trays = [t for t in req["tray_order"]
+                     if any(a["tray_id"] == t and a["status"] == "reserved"
+                            for a in req["allocations"])]
+    second_tray = pending_trays[0]
     code, res = call("POST", "/api/requisitions/%d/confirm-tray" % rid,
-                     {"scan_code": "TRAY-R2"})
+                     {"scan_code": trays_by_id[second_tray]["scan_code"]})
     check("扫第二盘码通过", res.get("ok"), str(res)[:200])
 
-    # 少取：确认前不扣库存；同盘候选不含异体格
+    # 少取：确认前不扣库存；同盘候选不含异体 / 规格格
     req = res["state"]["requisition"]
     cur = next(a for a in req["allocations"] if a["status"] == "active")
     qb = next(c for c in res["state"]["cells"]
@@ -1140,22 +1158,28 @@ def run_tests():
           and next(c for c in res["state"]["cells"]
                    if c["id"] == cur["cell_id"])["qty"] == qb)
     cands = [c["label"] for c in res["conflict"]["candidates"]]
-    check("候选只列同盘同规格未预留格",
-          "R3" not in cands and set(cands) <= {"R4"}, str(cands))
-    # 改选到 R4（本单未预留的备用同规格格）
-    r4c = next(c for c in res["state"]["cells"]
-               if c["tray_id"] == tr2 and c["label"] == "R4")
+    check("候选只列同盘同规格未预留格（B3）",
+          set(cands) == {"B3"}, str(cands))
+    # 改选到 B3（本单未预留的同规格备用格）
+    b3_now = next(c for c in res["state"]["cells"]
+                  if c["tray_id"] == trb and c["label"] == "B3")
     code, res = call("POST", "/api/requisitions/%d/change-source" % rid,
-                     {"allocation_id": cur["id"], "cell_id": r4c["id"],
+                     {"allocation_id": cur["id"], "cell_id": b3_now["id"],
                       "picked": 1})
     check("改选同盘另一来源格", res.get("ok"), str(res)[:200])
     req = res["state"]["requisition"]
     newcur = next(a for a in req["allocations"] if a["status"] == "active")
-    check("新来源格承接余量", newcur["cell_id"] == r4c["id"]
+    check("新来源格承接余量（改选子行单列、不与父行重复）",
+          newcur["cell_id"] == b3_now["id"]
+          and newcur["kind"] == "change"
           and newcur["qty"] == cur["qty"] - 1)
     check("确认前新格不扣库存",
           next(c for c in res["state"]["cells"]
-               if c["id"] == r4c["id"])["qty"] == r4c["qty"])
+               if c["id"] == b3_now["id"])["qty"] == b3_now["qty"])
+    check("预留合计不含父子重复行",
+          req["totals"]["plan_qty"] == 20
+          and req["totals"]["change_qty"] == cur["qty"] - 1,
+          str(req["totals"]))
     # 撤销上一笔：恢复原格为当前格、补回 1 枚
     code, res = call("POST", "/api/requisitions/%d/undo" % rid, {})
     req = res["state"]["requisition"]
@@ -1164,8 +1188,12 @@ def run_tests():
                if c["id"] == cur["cell_id"])["qty"] == qb
           and any(a["status"] == "active" and a["cell_id"] == cur["cell_id"]
                   for a in req["allocations"]), str(res)[:200])
+    check("撤销后预留合计恢复锁定值",
+          req["totals"]["plan_qty"] == 20
+          and req["totals"]["change_qty"] == 0, str(req["totals"]))
 
-    # 收尾：把剩余当前格逐笔走完（少取则保留缺口）
+    # 收尾：把剩余当前格逐笔走完（少取则保留缺口）；换盘时按预期盘扫码
+    gate_codes = {tra: "TRAY-RA", trb: "TRAY-RB"}
     guard = 0
     while guard < 12:
         req = call("GET", "/api/requisitions/%d" % rid)[1]["requisition"]
@@ -1174,8 +1202,14 @@ def run_tests():
         act = next((a for a in req["allocations"]
                     if a["status"] == "active"), None)
         if act is None:
+            pending_trays = {a["tray_id"] for a in req["allocations"]
+                             if a["status"] == "reserved"}
+            exp = next((t for t in req["tray_order"]
+                        if t in pending_trays), None)
+            if exp is None:
+                break
             code, res = call("POST", "/api/requisitions/%d/confirm-tray"
-                             % rid, {"scan_code": "TRAY-R2"})
+                             % rid, {"scan_code": gate_codes[exp]})
             if not res.get("ok"):
                 break
             continue
@@ -1196,6 +1230,16 @@ def run_tests():
     check("领用单完成", req["status"] == "done", req["status"])
     taken = sum(a["taken_qty"] for a in req["allocations"])
     check("实取数量入账", taken > 0)
+    # 汇总恒等式：需求 = 计划预留 + 规划缺口；执行后 实取 + 最终缺口 = 需求
+    dm_tong = next(d for d in req["demands"]
+                   if (d["char"], d["font"], d["size"])
+                   == ("铜", "宋体", "五号"))
+    check("完成单汇总一致（计划 20，缺口单列，实取+缺口=需求）",
+          req["totals"]["plan_qty"] == 20
+          and dm_tong["plan_qty"] == 20
+          and dm_tong["taken_qty"] + dm_tong["gap_total"] == 25,
+          str(req["totals"]) + " " + str(
+              {k: dm_tong[k] for k in ("plan_qty", "gap_total", "taken_qty")}))
 
     # 一键带入归还流程：按实取数量生成规划态批次，逐格扫码照旧
     code, res = call("POST", "/api/requisitions/%d/to-return" % rid, {})

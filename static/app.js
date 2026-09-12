@@ -1843,13 +1843,22 @@ function reqById(id) {
 }
 
 function reqDemandProgress(req, dm) {
-  const allocs = req.allocations.filter((a) => a.demand_id === dm.id);
-  const reserved = allocs.reduce((a, x) =>
-    a + (x.status === 'cancelled' ? 0 : x.qty), 0);
-  const taken = allocs.reduce((a, x) => a + x.taken_qty, 0);
-  const gap = allocs.filter((x) => x.status === 'gap')
-    .reduce((a, x) => a + x.qty, 0);
-  return { reserved, taken, gap, missing: dm.qty - reserved };
+  // 预留合计只计计划行（plan）；改选子行是计划缺额的追加，缺口子行单列，
+  // 不能与父计划行重复相加（后端已按 kind 汇总）
+  return {
+    reserved: dm.plan_qty != null ? dm.plan_qty
+      : req.allocations.filter((a) => a.demand_id === dm.id && a.kind === 'plan'
+        && a.status !== 'cancelled').reduce((a, x) => a + x.qty, 0),
+    change: dm.change_qty || 0,
+    taken: dm.taken_qty != null ? dm.taken_qty
+      : req.allocations.filter((a) => a.demand_id === dm.id)
+        .reduce((a, x) => a + x.taken_qty, 0),
+    gap: dm.gap_total != null ? dm.gap_total
+      : (dm.qty - (dm.plan_qty || 0)) +
+        req.allocations.filter((a) => a.demand_id === dm.id
+          && (a.kind === 'gap' || a.status === 'gap'))
+          .reduce((a, x) => a + x.qty, 0),
+  };
 }
 
 function reqOrder(req) {
@@ -2112,12 +2121,16 @@ function reqActiveHtml(req) {
   const gateId = reqGateTray(req);
   const curTrayId = cur ? cur.tray_id : (gateId || order[0]);
   const curTray = trayById(curTrayId);
-  const taken = req.allocations.reduce((a, x) => a + x.taken_qty, 0);
-  const total = req.allocations.filter((a) => a.status !== 'cancelled')
-    .reduce((a, x) => a + x.qty, 0);
+  const totals = req.totals || {
+    plan_qty: req.allocations.filter((a) => a.kind === 'plan')
+      .reduce((s, a) => s + a.qty, 0),
+    change_qty: 0, gap_qty: 0,
+    taken_qty: req.allocations.reduce((s, a) => s + a.taken_qty, 0),
+  };
   const doneAllocs = req.allocations.filter((a) => a.status === 'done').length;
-  const totalAllocs = req.allocations.filter((a) =>
-    a.status !== 'cancelled').length;
+  const liveAllocs = req.allocations.filter((a) =>
+    a.status !== 'cancelled' && a.status !== 'gap').length;
+  const total = totals.plan_qty + totals.change_qty;
   let curCard = '<p class="hint">等待扫描字盘码，确认换到下一个字盘。</p>';
   if (cur) {
     const remain = cur.qty - cur.taken_qty;
@@ -2169,10 +2182,11 @@ function reqActiveHtml(req) {
         '<div id="reqGateMsg" class="gate-msg"></div></div>' : '') +
     '</div><div class="run-side"><div class="panel">' +
     '<div class="row between"><h2>领用单 #' + req.id + '</h2>' +
-    '<span class="muted">' + doneAllocs + '/' + totalAllocs + ' 格 · ' +
-    taken + '/' + total + ' 枚</span></div>' +
+    '<span class="muted">' + doneAllocs + '/' + liveAllocs + ' 格 · ' +
+    totals.taken_qty + '/' + total + ' 枚' +
+    (totals.gap_qty ? ' · 缺口 ' + totals.gap_qty : '') + '</span></div>' +
     '<div class="progress"><div style="width:' +
-    (totalAllocs ? doneAllocs / totalAllocs * 100 : 0) +
+    (liveAllocs ? doneAllocs / liveAllocs * 100 : 0) +
     '%;height:100%;background:var(--done)"></div></div>' + curCard +
     '<div class="scan-row"><input id="reqScan" autocomplete="off" ' +
     'placeholder="扫描 / 输入当前盘格号后回车" ' + (cur ? '' : 'disabled') + '>' +
@@ -2453,55 +2467,89 @@ function printRequisition(req) {
     const p = reqDemandProgress(req, dm);
     return '<tr><td>' + esc(dm.char) + '</td><td>' + esc(dm.font || '任意') +
       ' / ' + esc(dm.size || '任意') + '</td><td>' + dm.qty + '</td><td>' +
-      p.reserved + '</td><td>' + (p.taken || 0) + '</td><td>' +
+      p.reserved + '</td><td>' + (p.change || '—') + '</td><td>' +
+      (p.taken || 0) + '</td><td>' +
       (p.gap ? '<b>' + p.gap + '</b>' : '—') + '</td><td>' +
       esc(dm.issue_text || (p.taken >= dm.qty ? '已领齐' : '')) + '</td></tr>';
   }).join('');
   const cards = [];
   for (const tid of order) {
     const tr = trayById(tid) || { name: '?', scan_code: '?' };
+    // 标签：计划行 + 改选行（缺口行不贴取字标签）；每张只印本格自身数量，
+    // 父计划行与改选子行各印一张，不重复相加
     const allocs = req.allocations.filter((a) => a.tray_id === tid
-      && a.status !== 'cancelled').sort((a, b) => a.seq - b.seq);
+      && a.status !== 'cancelled' && a.kind !== 'gap'
+      && a.status !== 'gap')
+      .sort((a, b) => a.seq - b.seq
+        || (a.kind === 'plan' ? -1 : 1) - (b.kind === 'plan' ? -1 : 1));
     allocs.forEach((a) => {
-      if (a.status === 'gap') return;  // 缺口不印取字标签
+      // 已实取完成的来源格印实际枚数；尚未取的格留空线供手工填，
+      // 保证标签实取合计与清单实取合计一致
+      const takenTxt = a.status === 'done' ? a.taken_qty : '____';
       cards.push(
         '<div class="label-card"><div class="lc-head"><span>字盘 <b>' +
         esc(tr.name) + '</b></span><span class="mono">' + esc(tr.scan_code || '—') +
         '</span></div><div class="lc-code">来源格 <b>' + esc(a.label) +
-        '</b> · 盘内 #' + a.seq + '</div><div class="lc-char">' +
-        esc(a.cell_char) + '</div><div class="lc-meta">' +
+        '</b> · 盘内 #' + a.seq +
+        (a.kind === 'change' ? ' · <span class="diff-up">改选</span>' : '') +
+        '</div><div class="lc-char">' + esc(a.cell_char) + '</div><div class="lc-meta">' +
         esc(a.cell_font || '—') + ' · ' + esc(a.cell_size || '—') +
-        '<br>预留 <b>' + a.qty + '</b> · 实取 ____' +
+        '<br>预留 <b>' + a.qty + '</b> · 实取 <b>' + takenTxt + '</b>' +
         '<br>领用单 #' + req.id + '　' + esc(req.created_at) + '</div></div>');
     });
   }
+  // 来源格明细：计划行 + 改选追加行 + 缺口行；每行只代表自身数量，
+  // 父子行不重复相加（改选行标注来源）
   const sourceRows = order.map((tid) => {
     const tr = trayById(tid) || { name: '?', scan_code: '?' };
     return req.allocations.filter((a) => a.tray_id === tid
-      && a.status !== 'cancelled').sort((a, b) => a.seq - b.seq).map((a) =>
-      '<tr><td>' + esc(tr.name) + '</td><td class="mono">' + esc(tr.scan_code || '—') +
-      '</td><td>' + esc(a.label) + '</td><td>' + esc(a.cell_char) + '</td><td>' +
-      esc(a.cell_font || '—') + ' / ' + esc(a.cell_size || '—') + '</td><td>' +
-      a.qty + '</td><td><b>' + a.taken_qty + '</b></td><td>' +
-      (a.status === 'gap' ? '<b>缺口 ' + a.qty + '</b>'
-        : S.alloc_status_names[a.status] || a.status) + '</td></tr>').join('');
+      && a.status !== 'cancelled')
+      .sort((a, b) => a.seq - b.seq || (a.id - b.id)).map((a) => {
+        let kindTag = '';
+        if (a.kind === 'change') kindTag = ' <span class="diff-up">改选追加</span>';
+        else if (a.kind === 'gap' || a.status === 'gap')
+          kindTag = ' <span class="diff-up">缺口</span>';
+        const statusTxt = a.status === 'gap' ? '缺口'
+          : (S.alloc_status_names[a.status] || a.status);
+        return '<tr><td>' + esc(tr.name) + '</td><td class="mono">' +
+          esc(tr.scan_code || '—') + '</td><td>' + esc(a.label) + kindTag +
+          '</td><td>' + esc(a.cell_char) + '</td><td>' +
+          esc(a.cell_font || '—') + ' / ' + esc(a.cell_size || '—') + '</td><td>' +
+          a.qty + '</td><td><b>' + a.taken_qty + '</b></td><td>' + statusTxt +
+          '</td></tr>';
+      }).join('');
   }).join('');
-  const takenTotal = req.allocations.reduce((a, x) => a + x.taken_qty, 0);
-  const gapTotal = req.allocations.filter((a) => a.status === 'gap')
-    .reduce((a, x) => a + x.qty, 0);
+  const totals = req.totals || {
+    plan_qty: req.allocations.filter((a) => a.kind === 'plan'
+      && a.status !== 'cancelled').reduce((s, a) => s + a.qty, 0),
+    change_qty: req.allocations.filter((a) => a.kind === 'change'
+      && a.status !== 'cancelled').reduce((s, a) => s + a.qty, 0),
+    gap_qty: req.allocations.filter((a) => a.kind === 'gap'
+      || a.status === 'gap').reduce((s, a) => s + a.qty, 0),
+    taken_qty: req.allocations.reduce((s, a) => s + a.taken_qty, 0),
+  };
+  const gapTotal = totals.gap_qty;
   $('#printArea').innerHTML =
     '<div class="stock-sheet req-sheet"><h2>配字领用清单</h2>' +
     '<p>领用单 <b>#' + req.id + '</b>　' + esc(req.name) + '　状态：' + stName +
     '　创建：' + esc(req.created_at) +
     (req.finished_at ? '　完成：' + esc(req.finished_at) : '') + '<br>' +
-    '实取合计 <b>' + takenTotal + '</b> 枚' +
+    '锁定预留 <b>' + totals.plan_qty + '</b> 枚' +
+    (totals.change_qty
+      ? '　其中改选实取 <b>' + totals.change_qty + '</b> 枚（含于实取，不另计）'
+      : '') +
+    '　实取合计 <b>' + totals.taken_qty + '</b> 枚' +
     (gapTotal ? '　<span class="diff-up">缺口合计 ' + gapTotal + ' 枚</span>' : '') +
     '</p><h3>需求汇总</h3><table><thead><tr><th>字符</th><th>规格</th>' +
-    '<th>需求</th><th>预留</th><th>实取</th><th>缺口</th><th>备注</th>' +
+    '<th>需求</th><th>锁定预留</th><th>改选实取</th><th>实取</th><th>缺口</th>' +
+    '<th>备注</th>' +
     '</tr></thead><tbody>' + demandRows + '</tbody></table>' +
+    '<p class="hint">说明：「改选实取」是少取后改从其他来源格补取的数量，' +
+    '已包含在「实取」与来源格明细内，不再与锁定预留相加；缺口 = 需求 − 实取。</p>' +
     '<h3>来源格明细（按字盘与盘内路线）</h3><table><thead><tr><th>字盘</th>' +
-    '<th>字盘码</th><th>格号</th><th>字符</th><th>规格</th><th>预留</th>' +
-    '<th>实取</th><th>状态</th></tr></thead><tbody>' + sourceRows + '</tbody></table>' +
+    '<th>字盘码</th><th>格号</th><th>字符</th><th>规格</th><th>本格预留</th>' +
+    '<th>本格实取</th><th>状态</th></tr></thead><tbody>' + sourceRows +
+    '</tbody></table>' +
     '<p class="sign">领用人：____________　复核人：____________　日期：____________</p>' +
     '<h3 class="page-break">来源格标签（裁剪后贴盘）</h3>' +
     '<div class="label-grid">' + cards.join('') + '</div></div>';
