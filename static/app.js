@@ -1262,11 +1262,12 @@ function stockCountingHtml(st) {
         esc(cur.book_label) + '" placeholder="扫到当前高亮格号"></label>' +
         '<label class="stock-field">实物点数' +
         '<input id="scQty" type="number" min="0" placeholder="实数，如 18"></label>' +
-        '<details class="spec-details"><summary>字符 / 字体 / 字号与账面不符？录入实物规格</summary>' +
+        '<details class="spec-details"><summary>字符 / 字体 / 字号与账面不符？录入实物规格（三项可分别填写）</summary>' +
+        '<p class="hint" style="margin:.2rem 0">哪一项与账面不同就填哪一项，其余留空即按账面；只改字体或只改字号同样会列为差异。</p>' +
         '<div class="form" style="margin-top:.4rem">' +
         '<label>实物字符 <input id="scChar" maxlength="4" placeholder="留空=与账面一致"></label>' +
-        '<label>实物字体 <input id="scFont" placeholder="留空=同账面"></label>' +
-        '<label>实物字号 <input id="scSize" placeholder="留空=同账面"></label>' +
+        '<label>实物字体 <input id="scFont" placeholder="留空=同账面，可单独改"></label>' +
+        '<label>实物字号 <input id="scSize" placeholder="留空=同账面，可单独改"></label>' +
         '</div></details>' +
         '<div class="row"><button id="btnScSubmit" class="primary">录入本格</button></div>' +
         '<div class="row">' +

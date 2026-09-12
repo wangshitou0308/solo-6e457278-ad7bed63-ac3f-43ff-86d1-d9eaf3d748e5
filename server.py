@@ -1398,14 +1398,19 @@ def count_stocktake_cell(sid, body):
             raise ApiError("请填写实物点数（非负整数）")
         if aq < 0:
             raise ApiError("实物点数不能为负")
-        # 实物规格：留空取账面；任一填写则按填写值，未填项回退账面
-        achar = body.get("actual_char")
-        if achar is None or str(achar).strip() == "":
-            achar, afont, asize = cur["book_char"], cur["book_font"], cur["book_size"]
-        else:
-            afont = str(body.get("actual_font") or "").strip() or cur["book_font"]
-            asize = str(body.get("actual_size") or "").strip() or cur["book_size"]
-            achar = str(achar).strip()
+        # 实物规格：字符 / 字体 / 字号三项相互独立，逐项处理——
+        # 每项各自“留空取账面、填写即覆盖”，因此只改字体或只改字号
+        # （字符留空）也会形成规格不符，进入差异复核。
+        def actual_field(key, book):
+            v = body.get(key)
+            if v is None:
+                return book
+            v = str(v).strip()
+            return v if v else book
+
+        achar = actual_field("actual_char", cur["book_char"])
+        afont = actual_field("actual_font", cur["book_font"])
+        asize = actual_field("actual_size", cur["book_size"])
         db.execute("UPDATE stocktake_cells SET status='counted', actual_qty=?, "
                    "actual_char=?, actual_font=?, actual_size=?, counted_at=? "
                    "WHERE id=?",
@@ -1450,7 +1455,11 @@ def undo_count(sid):
 
 @transactional
 def recheck_cell(sid, body):
-    """差异复核阶段把待复核格（混字 / 无法辨认 / 暂不能盘）拉回复盘。"""
+    """差异复核阶段把格位拉回复盘。
+
+    待复核格（混字 / 无法辨认 / 暂不能盘）与已盘但录错（含规格录错）的格
+    都可拉回；若该格的差异已有决议、或已据此生成移格任务，则需先撤销。
+    """
     st = _get_stocktake_row(sid)
     if st["status"] != "reviewing":
         raise ApiError("只有差异复核阶段可以复盘格位")
@@ -1458,15 +1467,36 @@ def recheck_cell(sid, body):
              (sid, body.get("cell_id")))
     if not sc:
         raise ApiError("该格不属于本盘点单")
-    if sc["status"] not in ("mixed", "unrecognized", "blocked"):
-        raise ApiError("只有待复核格位需要复盘")
-    # 已有盘盈盘亏决议或已生成移格任务时，先撤销 / 取消，避免差异悬挂
-    decided = row("SELECT COUNT(*) AS n FROM discrepancies WHERE stocktake_id=? "
-                  "AND decision!=''", (sid,))["n"]
-    tasked = row("SELECT COUNT(*) AS n FROM move_tasks WHERE stocktake_id=? "
-                 "AND status IN ('pending','src_ok','done')", (sid,))["n"]
-    if decided or tasked:
-        raise ApiError("已有盘盈 / 盘亏决议或移格任务，请先撤销后再复盘该格")
+    if sc["status"] == "pending":
+        raise ApiError("该格尚未盘点，无需复盘")
+    is_review = sc["status"] in ("mixed", "unrecognized", "blocked")
+    if is_review:
+        # 待复核格的复盘会重建整盘差异：任何未入账决议 / 移格都必须先撤销
+        decided = row("SELECT COUNT(*) AS n FROM discrepancies "
+                      "WHERE stocktake_id=? AND decision!=''", (sid,))["n"]
+        tasked = row(
+            "SELECT COUNT(*) AS n FROM move_tasks WHERE stocktake_id=? AND "
+            "status IN ('pending','src_ok','done')", (sid,))["n"]
+        if decided or tasked:
+            raise ApiError("已有盘盈 / 盘亏决议或移格任务，请先撤销后再复盘该格")
+    else:
+        # 普通已盘格：只拦该格自身差异上的决议、以及涉及该格的移格任务
+        disc_ids = [r["id"] for r in rows(
+            "SELECT id FROM discrepancies WHERE stocktake_id=? AND cell_id=?",
+            (sid, sc["cell_id"]))]
+        decided = 0
+        if disc_ids:
+            ph = ",".join("?" * len(disc_ids))
+            decided = row(
+                "SELECT COUNT(*) AS n FROM discrepancies WHERE id IN (%s) "
+                "AND decision!=''" % ph, tuple(disc_ids))["n"]
+        tasked = row(
+            "SELECT COUNT(*) AS n FROM move_tasks WHERE stocktake_id=? AND "
+            "status IN ('pending','src_ok','done') AND "
+            "(source_cell_id=? OR target_cell_id=?)",
+            (sid, sc["cell_id"], sc["cell_id"]))["n"]
+        if decided or tasked:
+            raise ApiError("该格已有盘盈 / 盘亏决议或移格任务，请先撤销后再复盘")
     db.execute("UPDATE stocktake_cells SET status='pending', actual_qty=NULL, "
                "actual_char=NULL, actual_font=NULL, actual_size=NULL, "
                "counted_at=NULL WHERE id=?", (sc["id"],))
